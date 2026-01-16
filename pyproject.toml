@@ -1,0 +1,45 @@
+[project]
+name = "poormanray"
+version = "0.1.0"
+description = "A minimal alternative to Ray for distributed data processing on EC2 instances"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+authors = [
+    { name = "Luca Soldaini", email = "luca@soldaini.net" },
+]
+dependencies = [
+    "boto3>=1.26.0",
+    "click>=8.0.0",
+    "paramiko>=3.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "boto3-stubs[ec2,ssm]",
+    "mypy",
+    "ruff",
+]
+
+[project.scripts]
+poormanray = "poormanray.cli:cli"
+pmr = "poormanray.cli:cli"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/poormanray"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
