@@ -746,7 +746,9 @@ class InstanceInfo:
             return False
 
     @classmethod
-    def get_latest_ami_id(cls, instance_type: str, client: Union["SSMClient", None] = None) -> str:
+    def get_latest_ami_id(
+        cls, instance_type: str, client: Union["SSMClient", None] = None, region: str | None = None
+    ) -> str:
         """
         Get the latest AMI ID for a given instance type and region
         """
@@ -758,7 +760,7 @@ class InstanceInfo:
         else:
             image_id = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"
 
-        client = client or ClientUtils.get_ssm_client(region=cls.region)
+        client = client or ClientUtils.get_ssm_client(region=region or cls.region)
         assert client, "SSM client is required"
 
         parameter = client.get_parameter(Name=image_id, WithDecryption=False)
@@ -813,7 +815,7 @@ class InstanceInfo:
         print(f"Using VPC ID: {vpc_id}")
 
         # If AMI ID is not provided, use a default Amazon Linux 2023 AMI (x86_64 or arm64 based on instance type)
-        ami_id = ami_id or cls.get_latest_ami_id(instance_type=instance_type, client=client)
+        ami_id = ami_id or cls.get_latest_ami_id(instance_type=instance_type, region=region)
 
         # Prepare the tags format required by EC2
         tag_specifications = [
