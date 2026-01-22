@@ -69,7 +69,7 @@ from paramiko.channel import ChannelFile, ChannelStdinFile
 
 if TYPE_CHECKING:
     from mypy_boto3_ec2.client import EC2Client
-    from mypy_boto3_ec2.type_defs import InstanceTypeDef, InstanceStatusTypeDef
+    from mypy_boto3_ec2.type_defs import InstanceStatusTypeDef, InstanceTypeDef
     from mypy_boto3_ssm.client import SSMClient
 
 from .utils import (
@@ -813,7 +813,7 @@ class InstanceInfo:
         print(f"Using VPC ID: {vpc_id}")
 
         # If AMI ID is not provided, use a default Amazon Linux 2023 AMI (x86_64 or arm64 based on instance type)
-        ami_id = ami_id or cls.get_latest_ami_id(instance_type)
+        ami_id = ami_id or cls.get_latest_ami_id(instance_type=instance_type, client=client)
 
         # Prepare the tags format required by EC2
         tag_specifications = [
@@ -1133,7 +1133,9 @@ def script_to_command(script_path: str, to_file: bool = True) -> str:
         file_name, extension = os.path.splitext(os.path.basename(script_path))
         h = hashlib.sha256(script_content).hexdigest()
         script_path = f"{file_name}-{h}{extension}"
-        return f"echo '{b64_script_content}' | base64 -d > {script_path} && chmod +x {script_path} && bash {script_path}"
+        return (
+            f"echo '{b64_script_content}' | base64 -d > {script_path} && chmod +x {script_path} && bash {script_path}"
+        )
     else:
         return f"echo {b64_script_content} | base64 -d | bash"
 
@@ -1683,8 +1685,7 @@ def setup_instances(
     if aws_access_key_id is None or aws_secret_access_key is None:
         logger.error("AWS credentials not found in environment variables")
         raise ValueError(
-            "No AWS credentials found; "
-            "please set the AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables"
+            "No AWS credentials found; please set the AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables"
         )
 
     # Generate AWS config files
@@ -1900,9 +1901,7 @@ def setup_decon(
 
     # Set up each instance with its specific host index
     for idx, instance in enumerate(instances):
-        logger.info(
-            f"Setting up Decon on instance {instance.instance_id} ({instance.name}) with PMR_HOST_INDEX={idx}"
-        )
+        logger.info(f"Setting up Decon on instance {instance.instance_id} ({instance.name}) with PMR_HOST_INDEX={idx}")
 
         # Generate the setup script with the specific host index for this instance
         decon_setup_script = make_decon_python_setup(github_token, host_index=idx, host_count=len(instances))
@@ -2037,9 +2036,7 @@ def map_commands(
             transfer_scripts_commands[-1].append(f"echo '{stop_command}'>> {job_uuid}/run_all.sh")
 
     # wrapping up the runner function
-    runner_fn = partial(
-        run_command, name=name, region=region, ssh_key_path=ssh_key_path, script=None, spindown=False
-    )
+    runner_fn = partial(run_command, name=name, region=region, ssh_key_path=ssh_key_path, script=None, spindown=False)
 
     for instance, setup_commands in zip(instances, transfer_scripts_commands):
         curr_instance_id = instance.instance_id
