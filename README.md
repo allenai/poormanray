@@ -12,8 +12,8 @@ git clone https://github.com/your-org/poormanray.git
 cd poormanray
 uv run pmr --help
 
-# Or install globally
-uv tool install .
+# Or install latest version globally
+uv tool install --from git+ssh://git@github.com/allenai/poormanray.git poormanray
 ```
 
 ## Quick Start
