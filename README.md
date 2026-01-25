@@ -1,5 +1,9 @@
 # poormanray
 
+<p align="center">
+  <img src="assets/pmr-logo-1024px.png" alt="poormanray library logo" width="512"/>
+</p>
+
 A minimal alternative to Ray for distributed data processing on EC2 instances. Manage clusters, run commands, and distribute jobs without the complexity of a full Ray deployment.
 
 ## Installation
