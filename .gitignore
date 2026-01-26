@@ -211,3 +211,4 @@ __marimo__/
 uv.lock
 tmp/
 temp/
+.DS_Store
