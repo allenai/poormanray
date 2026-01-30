@@ -1,7 +1,7 @@
 # poormanray
 
 <p align="center">
-  <img src="https://github.com/allenai/olmo-bonepick/blob/main/assets/pmr-logo-1024px.png?raw=true" alt="poormanray library logo" width="512"/>
+  <img src="https://github.com/allenai/poormanray/blob/main/assets/pmr-logo-1024px.png?raw=true" alt="poormanray library logo" width="512"/>
 </p>
 
 [![PyPI version](https://badge.fury.io/py/poormanray.svg)](https://badge.fury.io/py/poormanray)
