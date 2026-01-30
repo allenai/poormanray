@@ -4,20 +4,23 @@
   <img src="assets/pmr-logo-1024px.png" alt="poormanray library logo" width="512"/>
 </p>
 
+[![PyPI version](https://badge.fury.io/py/poormanray.svg)](https://badge.fury.io/py/poormanray)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+
 A minimal alternative to Ray for distributed data processing on EC2 instances. Manage clusters, run commands, and distribute jobs without the complexity of a full Ray deployment.
 
 ## Installation
 
-Requires Python 3.10+ and [uv](https://docs.astral.sh/uv/).
+Requires Python 3.10+.
 
 ```bash
-# Clone and run directly
-git clone https://github.com/your-org/poormanray.git
-cd poormanray
-uv run pmr --help
+# Install as a CLI tool (recommended)
+uv tool install poormanray
 
-# Or install latest version globally
-uv tool install --from git+ssh://git@github.com/allenai/poormanray.git poormanray
+# Or install as a library
+uv pip install poormanray
+pip install poormanray
 ```
 
 ## Quick Start

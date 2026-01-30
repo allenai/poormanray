@@ -1,6 +1,6 @@
 [project]
 name = "poormanray"
-version = "0.1.0"
+dynamic = ["version"]
 description = "A minimal alternative to Ray for distributed data processing on EC2 instances"
 readme = "README.md"
 license = "Apache-2.0"
@@ -8,6 +8,20 @@ requires-python = ">=3.10"
 authors = [
     { name = "Luca Soldaini", email = "luca@soldaini.net" },
 ]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Distributed Computing",
+]
+keywords = ["aws", "ec2", "distributed", "cluster", "ray", "data-processing"]
 dependencies = [
     "boto3>=1.26.0",
     "click>=8.0.0",
@@ -25,9 +39,17 @@ dev = [
 poormanray = "poormanray.cli:cli"
 pmr = "poormanray.cli:cli"
 
+[project.urls]
+Homepage = "https://github.com/allenai/poormanray"
+Repository = "https://github.com/allenai/poormanray"
+Issues = "https://github.com/allenai/poormanray/issues"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/poormanray/version.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/poormanray"]
