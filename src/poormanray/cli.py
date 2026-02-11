@@ -165,40 +165,64 @@ PKG_MANAGER=$(determine_package_manager)
 """
 
 
-D2TK_SETUP = """
+D2TK_SETUP = f"""
 #!/bin/bash
-# Set up raid drives
-sudo yum install mdadm -y
+
+{PACKAGE_MANAGER_DETECTOR}
+
+
+# Set up local NVMe drives (RAID0 if multiple, direct mount if single)
 NUM_DRIVES=$(echo "$(ls /dev/nvme*n1 | wc -l) - 1" | bc)
-MDADM_CMD="sudo mdadm --create /dev/md0 --level=0 --raid-devices=$NUM_DRIVES"
-for i in $(seq 1 $NUM_DRIVES); do
-  MDADM_CMD="$MDADM_CMD /dev/nvme${i}n1"
-done
-eval $MDADM_CMD
-sudo mkfs.xfs /dev/md0
-sudo mkdir /mnt/raid0
-sudo mount /dev/md0 /mnt/raid0
+sudo mkdir -p /mnt/raid0
+if [ "$NUM_DRIVES" -gt 1 ]; then
+  sudo yum install mdadm -y
+  MDADM_CMD="sudo mdadm --create /dev/md0 --level=0 --raid-devices=$NUM_DRIVES"
+  for i in $(seq 1 $NUM_DRIVES); do
+    MDADM_CMD="$MDADM_CMD /dev/nvme${{i}}n1"
+  done
+  eval $MDADM_CMD
+  sudo mkfs.xfs /dev/md0
+  sudo mount /dev/md0 /mnt/raid0
+elif [ "$NUM_DRIVES" -eq 1 ]; then
+  sudo mkfs.xfs /dev/nvme1n1
+  sudo mount /dev/nvme1n1 /mnt/raid0
+else
+  echo "No additional NVMe drives found, skipping drive setup"
+fi
 sudo chown -R $USER /mnt/raid0
+
 # Download and set up all packages we need
-sudo yum install gcc cmake openssl-devel gcc-c++ htop wget tmux screen -y
+sudo "${{PKG_MANAGER}}" update
+sudo "${{PKG_MANAGER}}" install gcc cmake openssl-devel gcc-c++ htop wget tmux screen git python3.12 python3.12-pip -y
+
+# Install S5CMD
 wget https://github.com/peak/s5cmd/releases/download/v2.2.2/s5cmd_2.2.2_Linux-64bit.tar.gz
 tar -xvzf s5cmd_2.2.2_Linux-64bit.tar.gz
 sudo mv s5cmd /usr/local/bin
-sudo yum install git -y
+
+# Install Rust
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs > rustup.sh
 bash rustup.sh -y
 source ~/.bashrc
-# Do datamap-rs setups
+
+# Setup datamap-rs
 cd
 git clone https://github.com/allenai/datamap-rs.git
 cd datamap-rs
 s5cmd run examples/all_dressed/s5cmd_asset_downloader.txt
 cargo build --release
-# Do minhash-rs setups
+
+# Setup duplodocus (nee minhash-rs)
 cd
-git clone https://github.com/revbucket/minhash-rs.git
-cd minhash-rs
+git clone https://github.com/allenai/duplodocus.git
+cd duplodocus
 cargo build --release
+
+# install github cli
+curl -sS https://webi.sh/gh | sh
+
+# Install uv via pip
+pip3.12 install uv
 """.strip()
 
 

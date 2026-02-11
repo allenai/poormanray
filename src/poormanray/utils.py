@@ -15,9 +15,7 @@ def get_aws_access_key_id() -> Optional[str]:
     """Get AWS access key ID from environment, AWS CLI, or credentials file."""
     if shutil.which("aws"):
         try:
-            output = subprocess.run(
-                shlex.split("aws configure get aws_access_key_id"), capture_output=True, check=True
-            )
+            output = subprocess.run(shlex.split("aws configure get aws_access_key_id"), capture_output=True, check=True)
             return output.stdout.decode().strip()
         except Exception:
             pass
