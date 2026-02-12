@@ -2086,6 +2086,70 @@ def map_commands(
     logger.info(f"Job {job_uuid} started on {len(instances):,} instances.")
 
 
+@common_cli_options
+def ssh_instance(
+    name: str,
+    region: str,
+    instance_id: list[str] | None,
+    ssh_key_path: str,
+    **kwargs,
+):
+    """
+    SSH into an EC2 instance. If multiple instances match, prompts for selection.
+
+    Args:
+        name: Project name to filter instances by
+        region: AWS region where instances are located
+        instance_id: Optional list of specific instance IDs to target
+        ssh_key_path: Path to SSH private key for authentication
+        **kwargs: Additional keyword arguments
+    """
+    client = ClientUtils.get_ec2_client(region=region)
+
+    instances = InstanceInfo.describe_instances(
+        region=region,
+        project=name,
+        statuses=[InstanceStatus.RUNNING],
+        client=client,
+    )
+
+    # Filter by instance ID if provided
+    if instance_id is not None:
+        instances = [inst for inst in instances if inst.instance_id in instance_id]
+
+    if len(instances) == 0:
+        logger.error(f"No running instances found with project={name} in region {region}")
+        raise click.ClickException("No running instances available to connect to.")
+
+    if len(instances) == 1:
+        target = instances[0]
+    else:
+        # Present selection menu
+        click.echo("Multiple instances available:\n")
+        for i, inst in enumerate(instances, 1):
+            click.echo(f"  {i}) {inst.name}  {inst.pretty_id}  {inst.pretty_ip}")
+        click.echo()
+
+        choice = click.prompt("Select instance number", type=click.IntRange(1, len(instances)))
+        target = instances[choice - 1]
+
+    logger.info(f"Connecting to {target.instance_id} ({target.name}) at {target.public_ip_address}")
+
+    ssh_cmd = [
+        "ssh",
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "-A",
+    ]
+    if ssh_key_path:
+        ssh_cmd.extend(["-i", ssh_key_path])
+    ssh_cmd.append(f"ec2-user@{target.public_ip_address}")
+
+    os.execvp("ssh", ssh_cmd)
+
+
 cli.command(name="create")(create_instances)
 cli.command(name="list")(list_instances)
 cli.command(name="terminate")(terminate_instances)
@@ -2097,6 +2161,7 @@ cli.command(name="setup-decon")(setup_decon)
 cli.command(name="map")(map_commands)
 cli.command(name="pause")(pause_instances)
 cli.command(name="resume")(resume_instances)
+cli.command(name="ssh")(ssh_instance)
 
 
 if __name__ == "__main__":
