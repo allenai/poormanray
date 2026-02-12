@@ -1525,6 +1525,7 @@ def setup_instances(
     owner: str,
     instance_id: list[str] | None,
     ssh_key_path: str,
+    instance_username: str,
     **kwargs,
 ):
     """
@@ -1589,6 +1590,7 @@ def setup_instances(
         detach=False,
         spindown=False,
         screen=True,
+        instance_username=instance_username,
     )
     logger.info("AWS credential setup completed")
 
@@ -1601,6 +1603,7 @@ def setup_dolma2_toolkit(
     instance_id: list[str] | None,
     ssh_key_path: str,
     detach: bool,
+    instance_username: str,
     **kwargs,
 ):
     """
@@ -1623,6 +1626,8 @@ def setup_dolma2_toolkit(
         owner=owner,
         instance_id=instance_id,
         ssh_key_path=ssh_key_path,
+        instance_username=instance_username,
+        detach=False,
     )
 
     # Encode the Dolma2 toolkit setup script for secure transfer
@@ -1649,6 +1654,7 @@ def setup_dolma2_toolkit(
         detach=detach,
         spindown=False,
         screen=True,
+        instance_username=instance_username,
     )
     logger.info("Dolma2 toolkit setup completed")
 
@@ -1661,6 +1667,7 @@ def setup_dolma_python(
     instance_id: list[str] | None,
     ssh_key_path: str,
     detach: bool,
+    instance_username: str,
     **kwargs,
 ):
     """
@@ -1683,6 +1690,8 @@ def setup_dolma_python(
         owner=owner,
         instance_id=instance_id,
         ssh_key_path=ssh_key_path,
+        instance_username=instance_username,
+        detach=False,
     )
 
     # Encode the Dolma2 toolkit setup script for secure transfer
@@ -1709,6 +1718,7 @@ def setup_dolma_python(
         detach=detach,
         spindown=False,
         screen=True,
+        instance_username=instance_username,
     )
     logger.info("Dolma Python setup completed")
 
@@ -1729,6 +1739,7 @@ def setup_decon(
     ssh_key_path: str,
     detach: bool,
     github_token: str | None,
+    instance_username: str,
     **kwargs,
 ):
     """
@@ -1752,6 +1763,8 @@ def setup_decon(
         owner=owner,
         instance_id=instance_id,
         ssh_key_path=ssh_key_path,
+        instance_username=instance_username,
+        detach=False,
     )
 
     # Get all instances that will be set up
@@ -1790,6 +1803,7 @@ def setup_decon(
             detach=detach,
             spindown=False,
             screen=True,
+            instance_username=instance_username,
         )
 
     logger.info("Decon setup completed on all instances")
@@ -1803,6 +1817,7 @@ def map_commands(
     ssh_key_path: str,
     script: list[str],
     spindown: bool,
+    instance_username: str,
     **kwargs,
 ):
     """
@@ -1910,6 +1925,7 @@ def map_commands(
             command="; ".join(setup_commands),
             detach=False,
             screen=False,
+            instance_username=instance_username,
         )
     logger.info(f"Scripts transferred on {len(instances):,} instances.")
 
@@ -1921,6 +1937,7 @@ def map_commands(
             command=f"bash {job_uuid}/run_all.sh",
             detach=True,
             screen=True,
+            instance_username=instance_username,
         )
     logger.info(f"Job {job_uuid} started on {len(instances):,} instances.")
 
