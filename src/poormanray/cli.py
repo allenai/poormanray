@@ -1276,6 +1276,13 @@ def common_cli_options(f: T) -> T:
             callback=validate_command_or_script,
             help="Path to a script file or directory containing scripts to execute on the instances",
         ),
+        click.option(
+            "-u",
+            "--instance-username",
+            type=str,
+            default="ec2-user",
+            help="Username to use for SSH connections to the instances",
+        ),
     ]
 
     return reduce(lambda f, decorator: decorator(f), click_decorators, f)
@@ -1607,6 +1614,7 @@ def run_command(
     ssh_key_path: str,
     detach: bool,
     spindown: bool,
+    instance_username: str,
     timeout: int | None = None,
     **kwargs,
 ):
@@ -1661,7 +1669,7 @@ def run_command(
             instance_id=instance.instance_id,
             region=region,
             private_key_path=ssh_key_path,
-            user="ec2-user",
+            user=instance_username,
         )
 
         # Verify instance is running
@@ -2092,6 +2100,7 @@ def ssh_instance(
     region: str,
     instance_id: list[str] | None,
     ssh_key_path: str,
+    instance_username: str,
     **kwargs,
 ):
     """
@@ -2145,7 +2154,7 @@ def ssh_instance(
     ]
     if ssh_key_path:
         ssh_cmd.extend(["-i", ssh_key_path])
-    ssh_cmd.append(f"ec2-user@{target.public_ip_address}")
+    ssh_cmd.append(f"{instance_username}@{target.public_ip_address}")
 
     os.execvp("ssh", ssh_cmd)
 
