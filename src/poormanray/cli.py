@@ -2,43 +2,40 @@
 Poor Man's Ray
 ==============
 
-This module provides a command-line interface (CLI) to start, stop, and manage EC2 instances,
-providing a minimal alternative to Ray for distributed data processing. It is primarily designed
-to work with version 2 of the Dolma toolkit.
+CLI to start, stop, and manage EC2 instances as a minimal alternative to Ray for
+distributed data processing. Primarily designed for the Dolma toolkit ecosystem.
 
-The CLI offers several commands for managing EC2 instances and executing tasks:
-- create: Launch new EC2 instances with specified configurations
-- list: Display information about running instances
-- terminate: Shut down and remove instances
-- run: Execute commands on instances
-- setup: Configure AWS credentials on instances
-- setup-d2tk: Install and configure the Dolma2 toolkit
-- map: Distribute scripts across multiple instances for parallel execution
+Commands:
+    Cluster management:
+        create              Launch new EC2 instances
+        list                Display information about running instances
+        terminate           Shut down and remove instances
+        pause / resume      Stop and start instances (preserves EBS)
+        wait                Poll until instances are running and healthy
+        ssh                 Open an interactive SSH session to an instance
 
-Examples:
----------
+    Command execution:
+        run                 Execute a command or script on instances
+        map                 Distribute scripts across instances for parallel execution
 
-Create a cluster of instances:
-    poormanray create --name chipstest --number 5 --instance-type i4i.2xlarge --detach
+    Instance setup:
+        setup               Configure AWS credentials (and install screen)
+        setup-d2tk          Install and configure the Dolma2 toolkit
+        setup-dolma-python  Install Python 3.12, uv, and the dolma package
+        setup-decon         Install the DECON pipeline with Rust toolchain
 
-List instances in a cluster:
-    poormanray list --name chipstest --region us-east-1
+    Misc:
+        version             Print the installed version
 
-Set up AWS credentials and D2TK pipeline on instances:
-    poormanray setup-d2tk --name chipstest --ssh-key-path ~/.ssh/id_rsa
+Examples::
 
-Set up decon pipeline on instances:
-    poormanray setup-decon --name chipstest --ssh-key-path ~/.ssh/id_rsa --github-token xxx
-
-Run a command on all instances in a cluster:
-    poormanray run --name chipstest --command "echo 'Hello, world!'" --ssh-key-path ~/.ssh/id_rsa
-
-Distribute and run multiple scripts across instances:
-    poormanray map --name chipstest --script tmp/test_scripts/* --ssh-key-path ~/.ssh/id_rsa
-
-Terminate all instances in a cluster:
-    poormanray terminate --name chipstest --region us-east-1
-
+    pmr create --name mycluster --number 5 --instance-type i4i.2xlarge
+    pmr wait --name mycluster
+    pmr setup --name mycluster
+    pmr run --name mycluster --command "echo hello"
+    pmr map --name mycluster --script ./jobs/
+    pmr ssh --name mycluster
+    pmr terminate --name mycluster
 
 Author: Luca Soldaini
 Email: luca@soldaini.net
@@ -545,29 +542,28 @@ class InstanceInfo:
 
         Args:
             instance_ids: Optional list of instance IDs to filter by
-            tags: Optional dictionary of tags to filter instances by
             client: Optional boto3 EC2 client to use
             region: AWS region to query (defaults to class region)
+            project: Optional project tag to filter by
+            owner: Deprecated; use contact instead
+            contact: Optional contact tag to filter by
+            statuses: Optional list of instance statuses to include
 
         Returns:
             List of InstanceInfo objects matching the specified criteria
         """
 
-        # default statuses
         statuses = statuses or InstanceStatus.active()
 
         client = client or ClientUtils.get_ec2_client(region=region or cls.region)
         assert client, "EC2 client is required"
 
         filters = []
-
-        # Add filters based on parameters
         filters.append({"Name": "instance-state-name", "Values": [status.value for status in statuses]})
 
         if instance_ids:
             filters.append({"Name": "instance-id", "Values": instance_ids})
 
-        # raise a warning if owner is set (deprecated)
         if owner:
             logger.warning("The owner tag is deprecated. Use the contact tag instead.")
 
@@ -577,12 +573,10 @@ class InstanceInfo:
         if project:
             filters.append({"Name": "tag:Project", "Values": [project]})
 
-        # Query EC2 API with filters if any are specified
         response_describe = client.describe_instances(  # pyright: ignore
             **({"Filters": filters} if filters else {})
         )
 
-        # Get instance status
         response_status = client.describe_instance_status(  # pyright: ignore
             InstanceIds=[
                 id_
@@ -598,7 +592,6 @@ class InstanceInfo:
             if isinstance((id_ := status.get("InstanceId")), str)
         }
 
-        # Extract and convert instances from the response
         instances = [
             InstanceInfo.from_instance(description=instance, status=instance_statuses.get(id_, None))
             for reservation in response_describe.get("Reservations", [])
@@ -646,17 +639,14 @@ class InstanceInfo:
         client = client or ClientUtils.get_ec2_client(region=self.region)
         assert client, "EC2 client is required"
 
-        # check if the instance is already paused
         if self.state == InstanceStatus.STOPPED:
             logger.info(f"Instance {self.instance_id} ({self.name}) is already paused")
             return True
 
         try:
-            # Pause the instance
             logger.info(f"Pausing instance {self.instance_id} ({self.name})...")
             client.stop_instances(InstanceIds=[self.instance_id])
 
-            # Wait for the instance to be fully paused if requested
             if wait_for_completion:
                 logger.info("Waiting for instance to be fully paused...")
                 waiter = client.get_waiter("instance_stopped")
@@ -683,17 +673,14 @@ class InstanceInfo:
         client = client or ClientUtils.get_ec2_client(region=self.region)
         assert client, "EC2 client is required"
 
-        # check if the instance is already running
         if self.state == InstanceStatus.RUNNING:
             logger.info(f"Instance {self.instance_id} ({self.name}) is already running")
             return True
 
         try:
-            # Resume the instance
             logger.info(f"Resuming instance {self.instance_id} ({self.name})...")
             client.start_instances(InstanceIds=[self.instance_id])
 
-            # Wait for the instance to be fully resumed if requested
             if wait_for_completion:
                 logger.info("Waiting for instance to be fully resumed...")
                 waiter = client.get_waiter("instance_running")
@@ -721,11 +708,9 @@ class InstanceInfo:
         assert client, "EC2 client is required"
 
         try:
-            # Terminate the instance
             logger.info(f"Terminating instance {self.instance_id} ({self.name})...")
             client.terminate_instances(InstanceIds=[self.instance_id])
 
-            # Wait for the instance to be fully terminated if requested
             if wait_for_termination:
                 logger.info("Waiting for instance to be fully terminated...")
                 waiter = client.get_waiter("instance_terminated")
@@ -735,7 +720,6 @@ class InstanceInfo:
             return True
 
         except client.exceptions.ClientError as e:
-            # Handle common error cases
             error_code = e.response.get("Error", {}).get("Code", "Unknown")
             if error_code == "InvalidInstanceID.NotFound":
                 logger.info(f"Instance {self.instance_id} not found in region {self.region}")
@@ -800,7 +784,6 @@ class InstanceInfo:
         Returns:
             InstanceInfo object representing the newly created EC2 instance
         """
-        # Initialize the EC2 client with the specified region
         client = client or ClientUtils.get_ec2_client(region=region)
         assert client, "EC2 client is required"
 
@@ -812,15 +795,12 @@ class InstanceInfo:
 
         print(f"Using VPC ID: {vpc_id}")
 
-        # If AMI ID is not provided, use a default Amazon Linux 2023 AMI (x86_64 or arm64 based on instance type)
         ami_id = ami_id or cls.get_latest_ami_id(instance_type=instance_type, region=region)
 
-        # Prepare the tags format required by EC2
         tag_specifications = [
             {"ResourceType": "instance", "Tags": [{"Key": key, "Value": value} for key, value in tags.items()]}
         ]
 
-        # Prepare instance launch parameters
         launch_params = {
             "ImageId": ami_id,
             "InstanceType": instance_type,
@@ -832,11 +812,9 @@ class InstanceInfo:
         if zone:
             launch_params["Placement"] = {"AvailabilityZone": zone}
 
-        # Add key pair if provided
         if key_name:
             launch_params["KeyName"] = key_name
 
-        # Add block device mapping if storage parameters are provided
         if storage_size is not None:
             launch_params.update(
                 {
@@ -854,25 +832,20 @@ class InstanceInfo:
                 }
             )
 
-        # Launch the EC2 instance
         response = client.run_instances(**launch_params)
 
-        # Extract instance information from the response
         if (instance_def := next(iter(response["Instances"]), None)) is None:
             raise Exception("No instance created")
         else:
             instance = InstanceInfo.from_instance(instance_def)
 
-        # Log instance creation
         logger.info(f"Created instance {instance.instance_id}")
 
-        # Wait for the instance to be in running state if requested
         if wait_for_completion:
             logger.info("Waiting for instance to enter 'running' state...")
             waiter = client.get_waiter("instance_running")
             waiter.wait(InstanceIds=[instance.instance_id])
 
-            # Additionally wait for status checks to pass
             logger.info("Instance is running. Waiting for status checks to pass...")
             waiter = client.get_waiter("instance_status_ok")
             waiter.wait(InstanceIds=[instance.instance_id])
@@ -893,11 +866,9 @@ def import_ssh_key_to_ec2(key_name: str, region: str, private_key_path: str) -> 
     Returns:
         The key pair ID if the import was successful.
     """
-    # Initialize the EC2 client with the specified region
     client = ClientUtils.get_ec2_client(region=region)
     assert client, "EC2 client is required"
 
-    # Use default SSH private key path if not specified
     if not private_key_path:
         home_dir = os.path.expanduser("~")
         for key_name in DEFAULT_PRIVATE_KEY_NAMES:
@@ -908,13 +879,11 @@ def import_ssh_key_to_ec2(key_name: str, region: str, private_key_path: str) -> 
     if not os.path.isfile(private_key_path):
         raise ValueError(f"Private key file not found at {private_key_path}")
 
-    # Generate public key from private key
     try:
-        # Load the private key
         with open(private_key_path, "r") as key_file:
             private_key_material = key_file.read().strip()
 
-        # Generate public key using ssh-keygen command
+        # Derive public key from private key via ssh-keygen
         ssh_public_key_path = f"{private_key_path}.pub"
         try:
             subprocess.run(
@@ -923,7 +892,6 @@ def import_ssh_key_to_ec2(key_name: str, region: str, private_key_path: str) -> 
                 stdout=open(ssh_public_key_path, "w"),
                 stderr=subprocess.PIPE,
             )
-            # Read the generated public key
             with open(ssh_public_key_path, "r") as pub_key_file:
                 public_key_material = pub_key_file.read().strip()
         except subprocess.CalledProcessError as e:
@@ -934,10 +902,10 @@ def import_ssh_key_to_ec2(key_name: str, region: str, private_key_path: str) -> 
         logger.error(f"Failed to generate public key from private key: {str(e)}")
         raise ValueError(f"Could not generate public key from private key: {str(e)}")
 
+    # Build a deterministic key name from hashes of both private and public material
     h = hashlib.sha256(private_key_material.encode()).hexdigest()
     key_name = f"{key_name}-{h}"
 
-    # Read the public key file
     with open(ssh_public_key_path, "r") as key_file:
         public_key_material = key_file.read().strip()
 
@@ -945,16 +913,13 @@ def import_ssh_key_to_ec2(key_name: str, region: str, private_key_path: str) -> 
     key_name = f"{key_name}-{h}"
 
     try:
-        # Check if key pair already exists
         try:
             client.describe_key_pairs(KeyNames=[key_name])
             logger.info(f"Key pair '{key_name}' already exists in region {region}. Skipping import.")
             return key_name
         except client.exceptions.ClientError:
-            # Key doesn't exist, continue with import
             pass
 
-        # Import the key
         response = client.import_key_pair(KeyName=key_name, PublicKeyMaterial=public_key_material)
 
         if response["KeyFingerprint"] is None:
@@ -979,14 +944,11 @@ def script_to_command(script_path: str, to_file: bool = True) -> str:
     Returns:
         The command to execute the script on the EC2 instance
     """
-    # check if the script path is a file
     assert os.path.isfile(script_path), f"Script file not found: {script_path}"
 
-    # read the script content
     with open(script_path, "rb") as f:
         script_content = f.read()
 
-    # encode script using base64
     b64_script_content = base64.b64encode(script_content).decode()
 
     if to_file:
@@ -1186,16 +1148,14 @@ def create_instances(
 
     assert owner is not None, "Cannot determine owner from environment; please specify --owner"
 
-    # Create tags for the instances
     tags = {"Project": name, "Contact": owner}
     logger.info(f"Using tags: {tags}")
 
-    # Import SSH key to EC2
     logger.info(f"Importing SSH key to EC2 in region {region}...")
     key_name = import_ssh_key_to_ec2(key_name=f"{owner}-{name}", region=region, private_key_path=ssh_key_path)
     logger.info(f"Imported SSH key with name: {key_name}")
 
-    # Check for existing instances with the same tags to determine starting index
+    # Determine starting index from existing instances to avoid name collisions
     existing_instances = InstanceInfo.describe_instances(
         region=region,
         project=name,
@@ -1217,14 +1177,10 @@ def create_instances(
         start_id = 0
         logger.info("No existing instances found. Starting with index 0")
 
-    # Initialize the EC2 client with the specified region
     ec2_client = ClientUtils.get_ec2_client(region=region)
-    logger.debug(f"Initialized EC2 client for region {region}")
-
     instances = []
     total_to_create = start_id + number
 
-    # Create each instance
     for i in range(start_id, total_to_create):
         logger.info(f"Creating instance {i + 1 - start_id} of {number} (index: {i})...")
 
@@ -1256,19 +1212,18 @@ def list_instances(
     **kwargs,
 ):
     """
-    List all instances with the given name and owner.
+    List all instances with the given name.
 
     Args:
         name: Project name to filter instances by
         region: AWS region to search in
-        owner: Owner name to filter instances by
+        instance_id: Optional list of specific instance IDs to display
         **kwargs: Additional keyword arguments
     """
     logger.info(f"Listing instances with project={name} in region {region}")
 
     client = ClientUtils.get_ec2_client(region=region)
 
-    # Retrieve matching instances
     instances = InstanceInfo.describe_instances(
         region=region,
         project=name,
@@ -1277,7 +1232,6 @@ def list_instances(
     )
     logger.info(f"Found {len(instances)} matching instances")
 
-    # Display instance details
     for i, instance in enumerate(sorted(instances, key=lambda x: x.name)):
         if instance_id is not None and instance.instance_id not in instance_id:
             continue
@@ -1310,14 +1264,13 @@ def terminate_instances(
         name: Project name to filter instances by
         region: AWS region where instances are located
         instance_id: Optional list of specific instance IDs to terminate
-        detach: Whether to return immediately without waiting for termination to complete
+        detach: Whether to return immediately without waiting for termination
         **kwargs: Additional keyword arguments
     """
     logger.info(f"Terminating instances with project={name} in region {region}")
 
     client = ClientUtils.get_ec2_client(region=region)
 
-    # Retrieve instances matching the project and owner tags
     instances = InstanceInfo.describe_instances(
         region=region,
         project=name,
@@ -1326,13 +1279,11 @@ def terminate_instances(
     )
     logger.info(f"Found {len(instances)} instances matching the specified tags")
 
-    # Filter by instance ID if provided
     if instance_id is not None:
         logger.info(f"Filtering to {len(instance_id)} specified instance IDs")
         instances = [instance for instance in instances if instance.instance_id in instance_id]
         logger.info(f"After filtering, {len(instances)} instances will be terminated")
 
-    # Terminate each instance
     for instance in instances:
         logger.info(f"Terminating instance {instance.instance_id} ({instance.name})")
         success = instance.terminate(wait_for_termination=not detach, client=client)
@@ -1353,19 +1304,18 @@ def pause_instances(
     **kwargs,
 ):
     """
-    Pause some/all EC2 instances in a cluster.
+    Pause (stop) some/all EC2 instances in a cluster.
 
     Args:
         name: Project name to filter instances by
         region: AWS region where instances are located
         instance_id: Optional list of specific instance IDs to pause
-        detach: Whether to return immediately without waiting for pause to complete
+        detach: Whether to return immediately without waiting for pause
     """
     logger.info(f"Pausing instances with project={name} in region {region}")
 
     client = ClientUtils.get_ec2_client(region=region)
 
-    # Retrieve instances matching the project and owner tags
     instances = InstanceInfo.describe_instances(
         region=region,
         project=name,
@@ -1374,13 +1324,11 @@ def pause_instances(
     )
     logger.info(f"Found {len(instances)} instances matching the specified tags")
 
-    # Filter by instance ID if provided
     if instance_id is not None:
         logger.info(f"Filtering to {len(instance_id)} specified instance IDs")
         instances = [instance for instance in instances if instance.instance_id in instance_id]
         logger.info(f"After filtering, {len(instances)} instances will be paused")
 
-    # Pause each instance
     for instance in instances:
         logger.info(f"Pausing instance {instance.instance_id} ({instance.name})")
         success = instance.pause(wait_for_completion=not detach, client=client)
@@ -1399,19 +1347,18 @@ def resume_instances(
     **kwargs,
 ):
     """
-    Resume some/all EC2 instances in a cluster.
+    Resume (start) some/all stopped EC2 instances in a cluster.
 
     Args:
         name: Project name to filter instances by
         region: AWS region where instances are located
         instance_id: Optional list of specific instance IDs to resume
-        detach: Whether to return immediately without waiting for resume to complete
+        detach: Whether to return immediately without waiting for resume
     """
     client = ClientUtils.get_ec2_client(region=region)
 
     logger.info(f"Resuming instances with project={name} in region {region}")
 
-    # Retrieve instances matching the project and owner tags
     instances = InstanceInfo.describe_instances(
         region=region,
         project=name,
@@ -1420,7 +1367,6 @@ def resume_instances(
     )
     logger.info(f"Found {len(instances)} instances matching the specified tags")
 
-    # Filter by instance ID if provided
     if instance_id is not None:
         logger.info(f"Filtering to {len(instance_id)} specified instance IDs")
         instances = [instance for instance in instances if instance.instance_id in instance_id]
@@ -1457,47 +1403,41 @@ def run_command(
     Args:
         name: Project name to filter instances by
         region: AWS region where instances are located
-        owner: Owner name to filter instances by
         instance_id: Optional list of specific instance IDs to run command on
         command: Command string to execute on instances
         script: Path to script file to execute on instances
         ssh_key_path: Path to SSH private key for authentication
-        detach: Whether to run command in detached mode
+        detach: Whether to run command in detached mode (via screen)
+        spindown: Whether to self-terminate the instance after the command completes
+        instance_username: SSH username for connecting to instances
         timeout: Optional timeout in seconds for command execution
         **kwargs: Additional keyword arguments
     """
     logger.info(f"Running command on instances with project={name} in region {region}")
 
-    # Validate command/script parameters
     if command is None and script is None:
         raise click.UsageError("Either --command or --script must be provided")
 
     if command is not None and script is not None:
         raise click.UsageError("--command and --script cannot both be provided")
 
-    # Retrieve instances matching the project and owner tags
     instances = InstanceInfo.describe_instances(region=region, project=name)
     logger.info(f"Found {len(instances)} instances matching the specified tags")
 
-    # Filter by instance ID if provided
     if instance_id is not None:
         logger.info(f"Filtering to {len(instance_id)} specified instance IDs")
         instances = [instance for instance in instances if instance.instance_id in instance_id]
         logger.info(f"After filtering, command will run on {len(instances)} instances")
 
-    # Process each instance
     for instance in instances:
         logger.info(f"Running command on instance {instance.instance_id} ({instance.name})")
 
-        # Convert script to command if script is provided
         command_to_run = script_to_command(script, to_file=True) if script is not None else command
-        assert command_to_run is not None, "command and script cannot both be None"  # this should never happen
+        assert command_to_run is not None, "command and script cannot both be None"
 
         if spindown:
-            # have the instance self-terminate after the command is run
             command_to_run = f"{command_to_run}; aws ec2 terminate-instances --instance-ids {instance.instance_id}"
 
-        # Create SSH session
         session = Session(
             instance_id=instance.instance_id,
             region=region,
@@ -1505,13 +1445,10 @@ def run_command(
             user=instance_username,
         )
 
-        # Verify instance is running
         if instance.state != InstanceStatus.RUNNING:
             logger.error(f"Instance {instance.instance_id} is not running (state: {instance.state})")
             raise ValueError(f"Instance {instance.instance_id} is not running")
 
-        # Execute command
-        logger.debug(f"Executing command on {instance.instance_id}")
         output_ = session.run(command_to_run, detach=detach, timeout=timeout)
         print(f"Instance {instance.instance_id}:")
         print(output_)
@@ -1531,45 +1468,40 @@ def setup_instances(
     **kwargs,
 ):
     """
-    Set up AWS credentials on EC2 instances.
+    Set up AWS credentials on EC2 instances and install GNU screen.
 
     Args:
         name: Project name to filter instances by
         region: AWS region where instances are located
-        owner: Owner name to filter instances by
+        owner: Owner name for logging
         instance_id: Optional list of specific instance IDs to set up
         ssh_key_path: Path to SSH private key for authentication
-        detach: Whether to run setup in detached mode
+        instance_username: SSH username for connecting to instances
         **kwargs: Additional keyword arguments
     """
     logger.info(f"Setting up AWS credentials on instances with project={name}, owner={owner} in region {region}")
 
-    # Get AWS credentials from environment
     aws_access_key_id = get_aws_access_key_id()
     aws_secret_access_key = get_aws_secret_access_key()
 
-    # Validate credentials
     if aws_access_key_id is None or aws_secret_access_key is None:
         logger.error("AWS credentials not found in environment variables")
         raise ValueError(
             "No AWS credentials found; please set the AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables"
         )
 
-    # Generate AWS config files
-    logger.debug("Generating AWS config and credentials files")
     aws_config = make_aws_config()
     aws_credentials = make_aws_credentials(
         aws_access_key_id=aws_access_key_id, aws_secret_access_key=aws_secret_access_key
     )
 
-    # Base64 encode the AWS config and credentials for secure transfer
+    # Base64-encode config files and screen installer for transfer
     aws_config_base64 = base64.b64encode(aws_config.encode("utf-8")).decode("utf-8")
     aws_credentials_base64 = base64.b64encode(aws_credentials.encode("utf-8")).decode("utf-8")
 
     screen_install = f"{PACKAGE_MANAGER_DETECTOR} sudo ${{PKG_MANAGER}} install -y screen"
     screen_install_base64 = base64.b64encode(screen_install.encode("utf-8")).decode("utf-8")
 
-    # Create setup command to create AWS config directory and write files
     setup_command = [
         "mkdir -p ~/.aws",
         f"echo '{aws_config_base64}' | base64 -d > ~/.aws/config",
@@ -1579,7 +1511,6 @@ def setup_instances(
         "./screen_setup.sh",
     ]
 
-    # Execute command on the instances
     logger.info("Running AWS credential setup command on instances")
     run_command(
         name=name,
@@ -1620,8 +1551,6 @@ def setup_dolma2_toolkit(
         detach: Whether to run setup in detached mode
         **kwargs: Additional keyword arguments
     """
-    # First set up AWS credentials on the instances
-    logger.info(f"Setting up AWS credentials on instances with project={name}, owner={owner} in region {region}")
     setup_instances(
         name=name,
         region=region,
@@ -1632,18 +1561,13 @@ def setup_dolma2_toolkit(
         detach=False,
     )
 
-    # Encode the Dolma2 toolkit setup script for secure transfer
-    logger.debug("Preparing Dolma2 toolkit setup script")
     base64_encoded_setup_command = base64.b64encode(D2TK_SETUP.encode("utf-8")).decode("utf-8")
-
-    # Create command to write and execute the setup script
     command = [
         f"echo '{base64_encoded_setup_command}' | base64 -d > setup.sh",
         "chmod +x setup.sh",
         "./setup.sh",
     ]
 
-    # Run the Dolma2 toolkit setup command on the instances
     logger.info(f"Setting up Dolma2 toolkit on instances with project={name}, owner={owner}")
     run_command(
         name=name,
@@ -1684,8 +1608,6 @@ def setup_dolma_python(
         detach: Whether to run setup in detached mode
         **kwargs: Additional keyword arguments
     """
-    # First set up AWS credentials on the instances
-    logger.info(f"Setting up AWS credentials on instances with project={name}, owner={owner} in region {region}")
     setup_instances(
         name=name,
         region=region,
@@ -1696,18 +1618,13 @@ def setup_dolma_python(
         detach=False,
     )
 
-    # Encode the Dolma2 toolkit setup script for secure transfer
-    logger.debug("Preparing Dolma2 toolkit setup script")
     base64_encoded_setup_command = base64.b64encode(DOLMA_PYTHON_SETUP.encode("utf-8")).decode("utf-8")
-
-    # Create command to write and execute the setup script
     command = [
         f"echo '{base64_encoded_setup_command}' | base64 -d > setup.sh",
         "chmod +x setup.sh",
         "./setup.sh",
     ]
 
-    # Run the Dolma2 toolkit setup command on the instances
     logger.info(f"Setting up Dolma Python on instances with project={name}, owner={owner}")
     run_command(
         name=name,
@@ -1754,11 +1671,9 @@ def setup_decon(
         instance_id: Optional list of specific instance IDs to target
         ssh_key_path: Path to SSH private key file
         detach: Whether to run setup in detached mode
-        github_token: GitHub personal access token with read permissions on for cloning private github.com/allenai/decon.git"
+        github_token: GitHub personal access token for cloning private repos (e.g. allenai/decon)
         **kwargs: Additional keyword arguments
     """
-    # First set up AWS credentials on the instances
-    logger.info(f"Setting up AWS credentials on instances with project={name}, owner={owner} in region {region}")
     setup_instances(
         name=name,
         region=region,
@@ -1769,33 +1684,27 @@ def setup_decon(
         detach=False,
     )
 
-    # Get all instances that will be set up
     instances = InstanceInfo.describe_instances(region=region, project=name)
 
-    # Filter by instance ID if provided
     if instance_id is not None:
         instances = [instance for instance in instances if instance.instance_id in instance_id]
 
-    logger.info(f"Setting up Decon on {len(instances)} instances with PMR environment variables")
+    logger.info(f"Setting up Decon on {len(instances)} instances")
 
-    # Set up each instance with its specific host index
+    # Each instance gets a unique PMR_HOST_INDEX for coordinated work
     for idx, instance in enumerate(instances):
         logger.info(
             f"Setting up Decon on instance {instance.instance_id} ({instance.name}) with PMR_HOST_INDEX={idx}"
         )
 
-        # Generate the setup script with the specific host index for this instance
         decon_setup_script = make_decon_python_setup(github_token, host_index=idx, host_count=len(instances))
         base64_encoded_setup_command = base64.b64encode(decon_setup_script.encode("utf-8")).decode("utf-8")
-
-        # Create command to write and execute the setup script
         command = [
             f"echo '{base64_encoded_setup_command}' | base64 -d > setup.sh",
             "chmod +x setup.sh",
             "./setup.sh",
         ]
 
-        # Run the setup command on this specific instance
         run_command(
             name=name,
             region=region,
@@ -1825,41 +1734,34 @@ def map_commands(
     **kwargs,
 ):
     """
-    Run scripts on some/all EC2 instances in a cluster.
+    Distribute scripts across EC2 instances and run them in parallel.
 
-    This function distributes a list of scripts evenly across available instances
-    and executes them in parallel.
+    Scripts are shuffled and split evenly across instances. Each instance gets a
+    ``run_all.sh`` that executes its assigned scripts sequentially, with progress
+    logged to ``run_all.log``. Execution happens in detached screen sessions.
 
     Args:
         name: Project name to filter instances by
         region: AWS region to search in
-        owner: Owner name to filter instances by
         instance_id: Optional list of specific instance IDs to target
         ssh_key_path: Path to SSH private key file
         script: List of script paths to distribute and execute
+        spindown: Whether to stop instances after their scripts complete
+        instance_username: SSH username for connecting to instances
         **kwargs: Additional keyword arguments
     """
-    # Set random seed for reproducible distribution
     random.seed(42)
-
-    # Validate script input
     assert isinstance(script, list) and len(script) > 0, "script must be a list with at least one script"
 
-    # Setup a UUID for the job; we will use to track all the jobs
     job_uuid = str(uuid.uuid4())
-
     logging.info(f"Starting job with UUID: {job_uuid}")
 
-    # Make a copy of the script list and shuffle it for even distribution
     script = script[:]
     random.shuffle(script)
     logger.info(f"Found {len(script):,} scripts to distribute")
 
-    # Get all the instances with the given name and owner
-    logger.info(f"Retrieving instances with project={name} in region {region}")
     instances = InstanceInfo.describe_instances(region=region, project=name)
 
-    # filter by instance_id if provided
     if instance_id is not None:
         instances = [instance for instance in instances if instance.instance_id in instance_id]
 
@@ -1870,55 +1772,41 @@ def map_commands(
 
     transfer_scripts_commands: list[list[str]] = []
 
-    # Distribute scripts across instances
+    # Split scripts evenly across instances and build transfer commands
     for i, instance in enumerate(instances):
-        # Calculate the range of scripts for this instance
         ratio = len(script) / len(instances)
         start_idx = round(ratio * i)
         end_idx = round(ratio * (i + 1))
         instance_scripts = script[start_idx:end_idx]
 
-        # Prepare commands to transfer and execute scripts
         transfer_scripts_commands.append([])
 
-        # Create a directory for the scripts associated with this job
-        # and add a run_all.sh script that will run all the scripts at once
+        # Create job directory and run_all.sh wrapper
         transfer_scripts_commands[-1].append(f"mkdir -p {job_uuid}")
         transfer_scripts_commands[-1].append(f"echo '#!/usr/bin/env bash' >> {job_uuid}/run_all.sh")
         transfer_scripts_commands[-1].append(f"echo 'set -x' >> {job_uuid}/run_all.sh")
         transfer_scripts_commands[-1].append(f"chmod +x {job_uuid}/run_all.sh")
 
         for one_script in instance_scripts:
-            # Read and base64 encode each script
             with open(one_script, "rb") as f:
                 base64_encoded_script = base64.b64encode(f.read()).decode("utf-8")
 
-            # Create commands to decode, save, and execute the script
             filename = os.path.basename(one_script)
 
-            # Create commands to decode, save, and execute the script
             cmds = [
-                # Decode the script into a file on the instance
                 f"echo {base64_encoded_script} | base64 -d > {job_uuid}/{filename}",
-                # Make the script executable
                 f"chmod +x {job_uuid}/{filename}",
-                # Add a start marker to the run_all.log file
                 f'echo "$(date) - {job_uuid}/{filename} - START" >> {job_uuid}/run_all.log',
-                # Add the script to the run_all.sh file
                 f"echo './{job_uuid}/{filename}' >> {job_uuid}/run_all.sh",
-                # Add a done marker to the run_all.log file
                 f'echo "$(date) - {job_uuid}/{filename} - DONE" >> {job_uuid}/run_all.log',
             ]
 
-            # add scripts to setup
             transfer_scripts_commands[-1].extend(cmds)
 
-        # add scripts to stop the run
         if spindown:
             stop_command = f"aws ec2 stop-instances --instance-ids {instance.instance_id}"
             transfer_scripts_commands[-1].append(f"echo '{stop_command}'>> {job_uuid}/run_all.sh")
 
-    # wrapping up the runner function
     runner_fn = partial(
         run_command, name=name, region=region, ssh_key_path=ssh_key_path, script=None, spindown=False
     )
@@ -1988,7 +1876,6 @@ def wait_instances(
         poll_interval: Seconds between polling attempts (default: 10)
         **kwargs: Additional keyword arguments
     """
-    # Resolve the ready check command from --command or --script, same as other entry points
     ready_command: str | None = None
     if script is not None:
         ready_command = script_to_command(script, to_file=True)
@@ -2001,12 +1888,10 @@ def wait_instances(
     while True:
         elapsed = time.time() - start_time
 
-        # Check timeout
         if timeout is not None and elapsed > timeout:
             logger.error(f"Timed out after {timeout}s waiting for instances to be ready")
             raise click.ClickException(f"Timed out after {timeout}s waiting for instances to be ready")
 
-        # Fetch current instance states (include pending + running + stopped for visibility)
         client = ClientUtils.get_ec2_client(region=region)
         instances = InstanceInfo.describe_instances(
             region=region,
@@ -2015,7 +1900,6 @@ def wait_instances(
             client=client,
         )
 
-        # Filter by instance ID if provided
         if instance_id is not None:
             instances = [inst for inst in instances if inst.instance_id in instance_id]
 
@@ -2049,14 +1933,12 @@ def wait_instances(
 
             return inst, healthy
 
-        # Check all instances in parallel
         results: list[tuple[InstanceInfo, bool]] = []
         with ThreadPoolExecutor(max_workers=min(total, 32)) as pool:
             futures = {pool.submit(check_instance, inst): inst for inst in instances}
             for future in as_completed(futures):
                 results.append(future.result())
 
-        # Sort results to match instance ordering
         results.sort(key=lambda r: r[0].name)
 
         ready_count = 0
@@ -2069,12 +1951,10 @@ def wait_instances(
                 state_str = inst.state.value
                 instance_details.append(f"  \033[93m·\033[0m {inst.name} ({inst.instance_id}) [{state_str}]")
 
-        # Build display
         frame = WAIT_FRAMES[frame_idx % len(WAIT_FRAMES)]
         frame_idx += 1
         elapsed_str = f"{int(elapsed)}s"
 
-        # Clear screen and show status
         click.echo("\033[2J\033[H", nl=False)  # clear screen, cursor to top
         if ready_count == total:
             click.echo(f"\033[92m✓\033[0m All {total} instance(s) ready! ({elapsed_str})\n")
@@ -2109,6 +1989,7 @@ def ssh_instance(
         region: AWS region where instances are located
         instance_id: Optional list of specific instance IDs to target
         ssh_key_path: Path to SSH private key for authentication
+        instance_username: SSH username for connecting to instances
         **kwargs: Additional keyword arguments
     """
     client = ClientUtils.get_ec2_client(region=region)
@@ -2120,7 +2001,6 @@ def ssh_instance(
         client=client,
     )
 
-    # Filter by instance ID if provided
     if instance_id is not None:
         instances = [inst for inst in instances if inst.instance_id in instance_id]
 

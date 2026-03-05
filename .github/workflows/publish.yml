@@ -53,7 +53,7 @@ jobs:
 
       - name: Bump minor version
         run: |
-          CURRENT=$(python -c "exec(open('src/poorman/version.py').read()); print(__version__)")
+          CURRENT=$(python -c "exec(open('src/poormanray/version.py').read()); print(__version__)")
           IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
           NEW_VERSION="$MAJOR.$((MINOR + 1)).0"
           echo "__version__ = \"$NEW_VERSION\"" > src/poormanray/version.py
