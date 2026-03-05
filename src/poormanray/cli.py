@@ -403,7 +403,7 @@ DEFAULT_PRIVATE_KEY_NAMES = [
 ]
 
 
-from .session import Session, SessionContent  # noqa: E402
+from .session import Session  # noqa: E402
 
 
 @dataclass
@@ -576,7 +576,7 @@ class InstanceInfo:
             filters.append({"Name": "tag:Project", "Values": [project]})
 
         # Query EC2 API with filters if any are specified
-        response_describe = client.describe_instances(**({"Filters": filters} if filters else {}))
+        response_describe = client.describe_instances(**({"Filters": filters} if filters else {}))  # pyright: ignore
 
         # Get instance status
         response_status = client.describe_instance_status(
@@ -989,9 +989,7 @@ def script_to_command(script_path: str, to_file: bool = True) -> str:
         file_name, extension = os.path.splitext(os.path.basename(script_path))
         h = hashlib.sha256(script_content).hexdigest()
         script_path = f"{file_name}-{h}{extension}"
-        return (
-            f"echo '{b64_script_content}' | base64 -d > {script_path} && chmod +x {script_path} && bash {script_path}"
-        )
+        return f"echo '{b64_script_content}' | base64 -d > {script_path} && chmod +x {script_path} && bash {script_path}"
     else:
         return f"echo {b64_script_content} | base64 -d | bash"
 
@@ -1778,7 +1776,9 @@ def setup_decon(
 
     # Set up each instance with its specific host index
     for idx, instance in enumerate(instances):
-        logger.info(f"Setting up Decon on instance {instance.instance_id} ({instance.name}) with PMR_HOST_INDEX={idx}")
+        logger.info(
+            f"Setting up Decon on instance {instance.instance_id} ({instance.name}) with PMR_HOST_INDEX={idx}"
+        )
 
         # Generate the setup script with the specific host index for this instance
         decon_setup_script = make_decon_python_setup(github_token, host_index=idx, host_count=len(instances))
@@ -1915,7 +1915,9 @@ def map_commands(
             transfer_scripts_commands[-1].append(f"echo '{stop_command}'>> {job_uuid}/run_all.sh")
 
     # wrapping up the runner function
-    runner_fn = partial(run_command, name=name, region=region, ssh_key_path=ssh_key_path, script=None, spindown=False)
+    runner_fn = partial(
+        run_command, name=name, region=region, ssh_key_path=ssh_key_path, script=None, spindown=False
+    )
 
     for instance, setup_commands in zip(instances, transfer_scripts_commands):
         curr_instance_id = instance.instance_id

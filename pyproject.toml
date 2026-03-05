@@ -4,7 +4,7 @@ dynamic = ["version"]
 description = "A minimal alternative to Ray for distributed data processing on EC2 instances"
 readme = "README.md"
 license = "Apache-2.0"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 authors = [
     { name = "Luca Soldaini", email = "luca@soldaini.net" },
 ]
@@ -16,9 +16,6 @@ classifiers = [
     "License :: OSI Approved :: Apache Software License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
     "Topic :: System :: Distributed Computing",
 ]
 keywords = ["aws", "ec2", "distributed", "cluster", "ray", "data-processing"]
@@ -55,13 +52,17 @@ path = "src/poormanray/version.py"
 packages = ["src/poormanray"]
 
 [tool.ruff]
-line-length = 120
-target-version = "py310"
+line-length = 115
 
-[tool.ruff.lint]
-select = ["E", "F", "I", "W"]
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+docstring-code-format = true
+docstring-code-line-length = "dynamic"
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.11"
 warn_return_any = true
 warn_unused_configs = true
