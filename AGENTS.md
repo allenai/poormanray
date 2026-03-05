@@ -76,3 +76,48 @@ uv run pmr terminate --name mytest
 ## Testing
 
 No test suite currently exists. Manual testing against AWS is required.
+
+## Release Notes
+
+Release notes live in `release-notes/<version>.txt`. When making commits that add features, fix bugs, or introduce meaningful changes, update the release notes file for the current development version.
+
+### Format
+
+Each release notes file follows this structure:
+
+```
+# Release Notes (<version>)
+
+## New Features
+- Description of new commands or capabilities.
+
+## Changes
+- Breaking changes, dependency updates, or behavioral changes.
+
+## Fixes
+- Bug fixes.
+
+## Housekeeping
+- Code refactors, CI changes, tooling updates, or other non-user-facing work.
+
+
+**Full Changelog**: https://github.com/allenai/poormanray/compare/<previous-tag>...<current-tag>
+```
+
+Only include sections that have entries. Each bullet should be concise — one or two sentences max. Use backticks for command names, flags, and code references.
+
+### When to update
+
+Update the release notes file as part of the same commit that introduces the change. If no release notes file exists yet for the current version, create one.
+
+## Commit Guidelines
+
+All commits made by AI agents (Claude, Codex, etc.) **must** include a sign-off line with the model name and version:
+
+```
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+Co-Authored-By: GPT-4.1 <noreply@openai.com>
+Co-Authored-By: Gemini 2.5 Pro <noreply@google.com>
+```
+
+Use the actual model name and version that generated the code. This applies to all AI models, not just Claude.
