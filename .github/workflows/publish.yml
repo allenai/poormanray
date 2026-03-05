@@ -40,3 +40,30 @@ jobs:
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+
+  bump-version:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Bump minor version
+        run: |
+          CURRENT=$(python -c "exec(open('src/poorman/version.py').read()); print(__version__)")
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+          NEW_VERSION="$MAJOR.$((MINOR + 1)).0"
+          echo "__version__ = \"$NEW_VERSION\"" > src/poormanray/version.py
+          echo "Bumped version: $CURRENT -> $NEW_VERSION"
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          NEW_VERSION=$(python -c "exec(open('src/poormanray/version.py').read()); print(__version__)")
+          git add src/poormanray/version.py
+          git commit -m "Bump version to $NEW_VERSION after release"
+          git push
