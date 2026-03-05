@@ -53,7 +53,9 @@ import os
 import random
 import re
 import subprocess
+import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from enum import Enum
 from functools import partial, reduce
@@ -1946,6 +1948,148 @@ def map_commands(
     logger.info(f"Job {job_uuid} started on {len(instances):,} instances.")
 
 
+WAIT_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+
+@common_cli_options
+@click.option(
+    "--poll-interval",
+    type=int,
+    default=10,
+    help="Polling interval in seconds (default: 10)",
+)
+def wait_instances(
+    name: str,
+    region: str,
+    instance_id: list[str] | None,
+    ssh_key_path: str,
+    timeout: int | None,
+    instance_username: str,
+    command: str | None,
+    script: str | None,
+    poll_interval: int,
+    **kwargs,
+):
+    """
+    Wait until all instances in a cluster are running and passing health checks.
+
+    Polls EC2 instance status and optionally runs a readiness command via SSH.
+    Shows a spinner animation while waiting and reports progress for multi-instance clusters.
+
+    Args:
+        name: Project name to filter instances by
+        region: AWS region where instances are located
+        instance_id: Optional list of specific instance IDs to wait for
+        ssh_key_path: Path to SSH private key for authentication
+        timeout: Optional timeout in seconds (default: wait indefinitely)
+        instance_username: Username for SSH connections
+        command: Optional command that must exit 0 for an instance to be considered ready
+        script: Optional script path that must exit 0 for an instance to be considered ready
+        poll_interval: Seconds between polling attempts (default: 10)
+        **kwargs: Additional keyword arguments
+    """
+    # Resolve the ready check command from --command or --script, same as other entry points
+    ready_command: str | None = None
+    if script is not None:
+        ready_command = script_to_command(script, to_file=True)
+    elif command is not None:
+        ready_command = command
+
+    start_time = time.time()
+    frame_idx = 0
+
+    while True:
+        elapsed = time.time() - start_time
+
+        # Check timeout
+        if timeout is not None and elapsed > timeout:
+            logger.error(f"Timed out after {timeout}s waiting for instances to be ready")
+            raise click.ClickException(f"Timed out after {timeout}s waiting for instances to be ready")
+
+        # Fetch current instance states (include pending + running + stopped for visibility)
+        client = ClientUtils.get_ec2_client(region=region)
+        instances = InstanceInfo.describe_instances(
+            region=region,
+            project=name,
+            statuses=InstanceStatus.unterminated(),
+            client=client,
+        )
+
+        # Filter by instance ID if provided
+        if instance_id is not None:
+            instances = [inst for inst in instances if inst.instance_id in instance_id]
+
+        if len(instances) == 0:
+            logger.error(f"No instances found with project={name} in region {region}")
+            raise click.ClickException("No instances found matching the specified criteria.")
+
+        total = len(instances)
+
+        def check_instance(inst: InstanceInfo) -> tuple[InstanceInfo, bool]:
+            """Check if a single instance is healthy, including optional ready command."""
+            all_checks = len(inst._status)
+            ok_checks = sum(1 for _, s in inst._status if s == "ok")
+            healthy = inst.state == InstanceStatus.RUNNING and all_checks > 0 and ok_checks == all_checks
+
+            if healthy and ready_command is not None:
+                try:
+                    session = Session(
+                        instance_id=inst.instance_id,
+                        region=region,
+                        private_key_path=ssh_key_path,
+                        user=instance_username,
+                    )
+                    check = session.run_single(f"{ready_command} && echo __READY__ || echo __NOT_READY__", timeout=30)
+                    if "__READY__" not in check.stdout:
+                        healthy = False
+                except Exception:
+                    healthy = False
+
+            return inst, healthy
+
+        # Check all instances in parallel
+        results: list[tuple[InstanceInfo, bool]] = []
+        with ThreadPoolExecutor(max_workers=min(total, 32)) as pool:
+            futures = {pool.submit(check_instance, inst): inst for inst in instances}
+            for future in as_completed(futures):
+                results.append(future.result())
+
+        # Sort results to match instance ordering
+        results.sort(key=lambda r: r[0].name)
+
+        ready_count = 0
+        instance_details = []
+        for inst, healthy in results:
+            if healthy:
+                ready_count += 1
+                instance_details.append(f"  \033[92m✓\033[0m {inst.name} ({inst.instance_id})")
+            else:
+                state_str = inst.state.value
+                instance_details.append(f"  \033[93m·\033[0m {inst.name} ({inst.instance_id}) [{state_str}]")
+
+        # Build display
+        frame = WAIT_FRAMES[frame_idx % len(WAIT_FRAMES)]
+        frame_idx += 1
+        elapsed_str = f"{int(elapsed)}s"
+
+        # Clear screen and show status
+        click.echo("\033[2J\033[H", nl=False)  # clear screen, cursor to top
+        if ready_count == total:
+            click.echo(f"\033[92m✓\033[0m All {total} instance(s) ready! ({elapsed_str})\n")
+            for detail in instance_details:
+                click.echo(detail)
+            click.echo()
+            logger.info(f"All {total} instances are ready after {elapsed_str}")
+            return
+        else:
+            click.echo(f"{frame} Waiting for instances... {ready_count}/{total} ready ({elapsed_str})\n")
+            for detail in instance_details:
+                click.echo(detail)
+            click.echo()
+
+        time.sleep(poll_interval)
+
+
 @common_cli_options
 def ssh_instance(
     name: str,
@@ -2022,6 +2166,7 @@ cli.command(name="setup-decon")(setup_decon)
 cli.command(name="map")(map_commands)
 cli.command(name="pause")(pause_instances)
 cli.command(name="resume")(resume_instances)
+cli.command(name="wait")(wait_instances)
 cli.command(name="ssh")(ssh_instance)
 
 
