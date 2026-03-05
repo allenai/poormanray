@@ -1304,7 +1304,7 @@ def terminate_instances(
     **kwargs,
 ):
     """
-    Terminate EC2 instances matching the specified criteria.
+    Terminate some/all EC2 instances in a cluster.
 
     Args:
         name: Project name to filter instances by
@@ -1353,7 +1353,7 @@ def pause_instances(
     **kwargs,
 ):
     """
-    Pause EC2 instances matching the specified criteria.
+    Pause some/all EC2 instances in a cluster.
 
     Args:
         name: Project name to filter instances by
@@ -1399,7 +1399,7 @@ def resume_instances(
     **kwargs,
 ):
     """
-    Resume EC2 instances matching the specified criteria.
+    Resume some/all EC2 instances in a cluster.
 
     Args:
         name: Project name to filter instances by
@@ -1825,7 +1825,7 @@ def map_commands(
     **kwargs,
 ):
     """
-    Map and distribute scripts across multiple EC2 instances.
+    Run scripts on some/all EC2 instances in a cluster.
 
     This function distributes a list of scripts evenly across available instances
     and executes them in parallel.
@@ -1971,7 +1971,7 @@ def wait_instances(
     **kwargs,
 ):
     """
-    Wait until all instances in a cluster are running and passing health checks.
+    Wait until all instances in a cluster are ready.
 
     Polls EC2 instance status and optionally runs a readiness command via SSH.
     Shows a spinner animation while waiting and reports progress for multi-instance clusters.
@@ -2155,6 +2155,14 @@ def ssh_instance(
     ssh_cmd.append(f"{instance_username}@{target.public_ip_address}")
 
     os.execvp("ssh", ssh_cmd)
+
+
+@cli.command()
+def version():
+    """Print the version of poormanray."""
+    from poormanray.version import __version__
+
+    click.echo(f"{__version__}")
 
 
 cli.command(name="create")(create_instances)
