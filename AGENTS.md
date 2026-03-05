@@ -79,7 +79,7 @@ No test suite currently exists. Manual testing against AWS is required.
 
 ## Release Notes
 
-Release notes live in `release-notes/<version>.txt`. When making commits that add features, fix bugs, or introduce meaningful changes, update the release notes file for the current development version.
+Release notes live in `release-notes/<version>.md`. When making commits that add features, fix bugs, or introduce meaningful changes, update the release notes file for the current development version.
 
 ### Format
 
@@ -112,6 +112,13 @@ Update the release notes file as part of the same commit that introduces the cha
 
 ## Commit Guidelines
 
+When making commits, you need to follow these guidelines:
+
+### Update release notes
+
+You should update the release notes file in `release_notes/` matching the current version of this software. You can find current version at `src/poormanray/version.py`; the matching release notes file will be named `<version>.md`. If it doesn't exist, create it.
+
+### Sign-off
 All commits made by AI agents (Claude, Codex, etc.) **must** include a sign-off line with the model name and version:
 
 ```
