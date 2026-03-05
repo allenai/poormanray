@@ -2039,7 +2039,9 @@ def wait_instances(
                         private_key_path=ssh_key_path,
                         user=instance_username,
                     )
-                    check = session.run_single(f"{ready_command} && echo __READY__ || echo __NOT_READY__", timeout=30)
+                    check = session.run_single(
+                        f"{ready_command} && echo __READY__ || echo __NOT_READY__", timeout=30
+                    )
                     if "__READY__" not in check.stdout:
                         healthy = False
                 except Exception:
