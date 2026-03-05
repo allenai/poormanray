@@ -576,10 +576,12 @@ class InstanceInfo:
             filters.append({"Name": "tag:Project", "Values": [project]})
 
         # Query EC2 API with filters if any are specified
-        response_describe = client.describe_instances(**({"Filters": filters} if filters else {}))  # pyright: ignore
+        response_describe = client.describe_instances(  # pyright: ignore
+            **({"Filters": filters} if filters else {})
+        )
 
         # Get instance status
-        response_status = client.describe_instance_status(
+        response_status = client.describe_instance_status(  # pyright: ignore
             InstanceIds=[
                 id_
                 for reservation in response_describe.get("Reservations", [])
