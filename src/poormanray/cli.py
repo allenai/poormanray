@@ -47,6 +47,48 @@ def cli():
 
 
 T = TypeVar("T", bound=Callable)
+I = TypeVar("I")
+R = TypeVar("R")
+
+
+def run_in_parallel(
+    items: list[I],
+    worker: Callable[[I], R],
+    *,
+    parallelism: int | None = None,
+    action_name: str = "tasks",
+) -> tuple[dict[int, R], dict[int, Exception]]:
+    """
+    Run work items concurrently and collect indexed results.
+
+    Args:
+        items: Items to process.
+        worker: Function that processes one item.
+        parallelism: Maximum worker count; defaults to all items.
+        action_name: Human-readable action name for logs.
+
+    Returns:
+        tuple[dict[int, R], dict[int, Exception]]: Successful results and exceptions,
+            keyed by original item index.
+    """
+    if len(items) == 0:
+        return {}, {}
+
+    max_workers = len(items) if parallelism is None else min(parallelism, len(items))
+    logger.info(f"Running {action_name} for {len(items)} item(s) with max parallelism={max_workers}")
+
+    results: dict[int, R] = {}
+    errors: dict[int, Exception] = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(worker, item): index for index, item in enumerate(items)}
+        for future in as_completed(futures):
+            index = futures[future]
+            try:
+                results[index] = future.result()
+            except Exception as e:
+                errors[index] = e
+
+    return results, errors
 
 
 def common_cli_options(f: T) -> T:
@@ -185,6 +227,13 @@ def common_cli_options(f: T) -> T:
             help="AMI ID to use for the instances",
         ),
         click.option(
+            "-j",
+            "--parallelism",
+            type=click.IntRange(min=1),
+            default=None,
+            help="Maximum number of instances to run in parallel (default: all selected instances)",
+        ),
+        click.option(
             "-d/-nd",
             "--detach/--no-detach",
             "detach",
@@ -259,28 +308,38 @@ def create_instances(
     storage_size: int | None,
     storage_iops: int | None,
     zone: str | None,
+    parallelism: int | None,
     **kwargs,
 ):
     """
-    Spin up one or more EC2 instances.
+    Create one or more EC2 instances for a cluster.
+
+    Imports the local SSH key into EC2, tags each instance with cluster metadata,
+    and assigns deterministic `Name` tags (`<name>-0000`, `<name>-0001`, ...). If
+    matching instances already exist, numbering continues from the highest suffix
+    to avoid collisions. When not detached, instance creation waits for completion.
+
+    \f
 
     Args:
-        name: Project name to tag instances with
-        instance_type: EC2 instance type (e.g., t2.micro)
-        number: Number of instances to create
-        region: AWS region to create instances in
-        owner: Owner name to tag instances with
-        ssh_key_path: Path to SSH private key file
-        ami_id: Optional AMI ID to use (if None, latest Amazon Linux 2 AMI will be used)
-        detach: Whether to detach after creation without waiting for completion
-        storage_type: Type of EBS storage (e.g., 'gp2', 'gp3'). If None, uses AWS default
-        storage_size: Size of root volume in GB. If None, uses AWS default
-        storage_iops: IOPS for the root volume. If None, uses AWS default
-        zone: Availability zone to use for the instances; if None, uses AWS default
-        **kwargs: Additional keyword arguments
+        name: Cluster name used for `Project` and `Name` tags.
+        project: Optional ai2 project name stored in the `ai2-project` tag.
+        instance_type: EC2 instance type to launch (for example, `i4i.xlarge`).
+        number: Number of new instances to create.
+        region: AWS region where instances are created.
+        owner: Contact/owner tag value and SSH key name prefix.
+        ssh_key_path: Path to the local private SSH key file to import.
+        ami_id: Optional AMI ID override; if unset, the default AMI resolution is used.
+        detach: If `True`, return without waiting for instances to finish launching.
+        storage_type: Optional EBS root volume type override.
+        storage_size: Optional EBS root volume size in GiB.
+        storage_iops: Optional EBS root volume IOPS value.
+        zone: Optional availability zone override.
+        parallelism: Maximum number of instances to create concurrently.
+        **kwargs: Additional CLI options injected by shared decorators; ignored here.
 
     Returns:
-        List of created InstanceInfo objects
+        list[InstanceInfo]: Created instances in launch order.
     """
     logger.info(f"Creating {number} instances of type {instance_type} in region {region}")
 
@@ -320,15 +379,14 @@ def create_instances(
         start_id = 0
         logger.info("No existing instances found. Starting with index 0")
 
-    ec2_client = ClientUtils.get_ec2_client(region=region)
-    instances = []
-    total_to_create = start_id + number
+    create_indices = list(range(start_id, start_id + number))
 
-    for i in range(start_id, total_to_create):
-        logger.info(f"Creating instance {i + 1 - start_id} of {number} (index: {i})...")
+    def create_single(index: int) -> InstanceInfo:
+        logger.info(f"Creating instance {index + 1 - start_id} of {number} (index: {index})...")
+        ec2_client = ClientUtils.get_ec2_client(region=region)
         instance = InstanceInfo.create_instance(
             instance_type=instance_type,
-            tags=tags | {"Name": f"{name}-{i:04d}"},  # Add Name tag with index
+            tags=tags | {"Name": f"{name}-{index:04d}"},  # Add Name tag with index
             key_name=key_name,
             region=region,
             ami_id=ami_id,
@@ -339,9 +397,25 @@ def create_instances(
             storage_iops=storage_iops,
             zone=zone,
         )
-
         logger.info(f"Created instance {instance.instance_id} with name {instance.name}")
-        instances.append(instance)
+        return instance
+
+    created, errors = run_in_parallel(
+        create_indices,
+        create_single,
+        parallelism=parallelism,
+        action_name="instance creation",
+    )
+
+    for idx, err in sorted(errors.items()):
+        failed_index = create_indices[idx]
+        logger.error(f"Failed to create instance for index {failed_index}: {err}")
+
+    if len(errors) > 0:
+        failed_indexes = ", ".join(str(create_indices[idx]) for idx in sorted(errors))
+        raise click.ClickException(f"Instance creation failed for {len(errors)} instance(s): {failed_indexes}")
+
+    instances = [created[idx] for idx in sorted(created)]
 
     logger.info(f"Successfully created {len(instances)} instances")
     return instances
@@ -355,13 +429,19 @@ def list_instances(
     **kwargs,
 ):
     """
-    List all instances with the given name.
+    List EC2 instances in a cluster.
+
+    Queries EC2 for all unterminated instances tagged with the cluster name,
+    optionally filters to explicit instance IDs, and prints a readable summary of
+    each instance (identity, state, networking, health checks, and tags).
+
+    \f
 
     Args:
-        name: Project name to filter instances by
-        region: AWS region to search in
-        instance_id: Optional list of specific instance IDs to display
-        **kwargs: Additional keyword arguments
+        name: Cluster name used to select instances via the `Project` tag.
+        region: AWS region to query.
+        instance_id: Optional instance IDs to include in output.
+        **kwargs: Additional CLI options injected by shared decorators; ignored here.
     """
     logger.info(f"Listing instances with project={name} in region {region}")
 
@@ -398,17 +478,25 @@ def terminate_instances(
     region: str,
     instance_id: list[str] | None,
     detach: bool,
+    parallelism: int | None,
     **kwargs,
 ):
     """
-    Terminate some/all EC2 instances in a cluster.
+    Terminate EC2 instances in a cluster.
+
+    Selects unterminated instances by cluster tag, optionally filters to specific
+    instance IDs, and sends termination requests. By default, waits for each
+    termination call; with `--detach`, requests are sent without waiting.
+
+    \f
 
     Args:
-        name: Project name to filter instances by
-        region: AWS region where instances are located
-        instance_id: Optional list of specific instance IDs to terminate
-        detach: Whether to return immediately without waiting for termination
-        **kwargs: Additional keyword arguments
+        name: Cluster name used to select instances via the `Project` tag.
+        region: AWS region where instances are terminated.
+        instance_id: Optional instance IDs to terminate.
+        detach: If `True`, do not wait for instance termination to complete.
+        parallelism: Maximum number of instances to terminate concurrently.
+        **kwargs: Additional CLI options injected by shared decorators; ignored here.
     """
     logger.info(f"Terminating instances with project={name} in region {region}")
 
@@ -427,10 +515,22 @@ def terminate_instances(
         instances = [instance for instance in instances if instance.instance_id in instance_id]
         logger.info(f"After filtering, {len(instances)} instances will be terminated")
 
-    for instance in instances:
+    def terminate_single(instance: InstanceInfo) -> bool:
         logger.info(f"Terminating instance {instance.instance_id} ({instance.name})")
-        success = instance.terminate(wait_for_termination=not detach, client=client)
-        if success:
+        op_client = ClientUtils.get_ec2_client(region=region)
+        return instance.terminate(wait_for_termination=not detach, client=op_client)
+
+    terminated, errors = run_in_parallel(
+        instances,
+        terminate_single,
+        parallelism=parallelism,
+        action_name="instance termination",
+    )
+
+    for idx, instance in enumerate(instances):
+        if idx in errors:
+            logger.error(f"Failed to terminate instance {instance.instance_id} ({instance.name}): {errors[idx]}")
+        elif terminated.get(idx):
             logger.info(f"Successfully terminated instance {instance.instance_id} ({instance.name})")
         else:
             logger.error(f"Failed to terminate instance {instance.instance_id} ({instance.name})")
@@ -444,16 +544,25 @@ def pause_instances(
     region: str,
     instance_id: list[str] | None,
     detach: bool,
+    parallelism: int | None,
     **kwargs,
 ):
     """
-    Pause (stop) some/all EC2 instances in a cluster.
+    Pause (stop) running EC2 instances in a cluster.
+
+    Finds running instances for the cluster, optionally filters to explicit
+    instance IDs, and issues stop requests. By default, waits for each stop call;
+    with `--detach`, requests are issued without waiting for completion.
+
+    \f
 
     Args:
-        name: Project name to filter instances by
-        region: AWS region where instances are located
-        instance_id: Optional list of specific instance IDs to pause
-        detach: Whether to return immediately without waiting for pause
+        name: Cluster name used to select instances via the `Project` tag.
+        region: AWS region where instances are stopped.
+        instance_id: Optional instance IDs to stop.
+        detach: If `True`, do not wait for stop operations to complete.
+        parallelism: Maximum number of instances to stop concurrently.
+        **kwargs: Additional CLI options injected by shared decorators; ignored here.
     """
     logger.info(f"Pausing instances with project={name} in region {region}")
 
@@ -472,10 +581,22 @@ def pause_instances(
         instances = [instance for instance in instances if instance.instance_id in instance_id]
         logger.info(f"After filtering, {len(instances)} instances will be paused")
 
-    for instance in instances:
+    def pause_single(instance: InstanceInfo) -> bool:
         logger.info(f"Pausing instance {instance.instance_id} ({instance.name})")
-        success = instance.pause(wait_for_completion=not detach, client=client)
-        if success:
+        op_client = ClientUtils.get_ec2_client(region=region)
+        return instance.pause(wait_for_completion=not detach, client=op_client)
+
+    paused, errors = run_in_parallel(
+        instances,
+        pause_single,
+        parallelism=parallelism,
+        action_name="instance pause",
+    )
+
+    for idx, instance in enumerate(instances):
+        if idx in errors:
+            logger.error(f"Failed to pause instance {instance.instance_id} ({instance.name}): {errors[idx]}")
+        elif paused.get(idx):
             logger.info(f"Successfully paused instance {instance.instance_id} ({instance.name})")
         else:
             logger.error(f"Failed to pause instance {instance.instance_id} ({instance.name})")
@@ -487,16 +608,25 @@ def resume_instances(
     region: str,
     instance_id: list[str] | None,
     detach: bool,
+    parallelism: int | None,
     **kwargs,
 ):
     """
-    Resume (start) some/all stopped EC2 instances in a cluster.
+    Resume (start) stopped EC2 instances in a cluster.
+
+    Finds stopped instances for the cluster, optionally filters to explicit
+    instance IDs, and starts each selected instance. By default, waits for each
+    start request; with `--detach`, requests are sent without waiting.
+
+    \f
 
     Args:
-        name: Project name to filter instances by
-        region: AWS region where instances are located
-        instance_id: Optional list of specific instance IDs to resume
-        detach: Whether to return immediately without waiting for resume
+        name: Cluster name used to select instances via the `Project` tag.
+        region: AWS region where instances are started.
+        instance_id: Optional instance IDs to start.
+        detach: If `True`, do not wait for start operations to complete.
+        parallelism: Maximum number of instances to start concurrently.
+        **kwargs: Additional CLI options injected by shared decorators; ignored here.
     """
     client = ClientUtils.get_ec2_client(region=region)
 
@@ -515,10 +645,22 @@ def resume_instances(
         instances = [instance for instance in instances if instance.instance_id in instance_id]
         logger.info(f"After filtering, {len(instances)} instances will be resumed")
 
-    # Resume each instance
-    for instance in instances:
-        success = instance.resume(wait_for_completion=not detach, client=client)
-        if success:
+    def resume_single(instance: InstanceInfo) -> bool:
+        logger.info(f"Resuming instance {instance.instance_id} ({instance.name})")
+        op_client = ClientUtils.get_ec2_client(region=region)
+        return instance.resume(wait_for_completion=not detach, client=op_client)
+
+    resumed, errors = run_in_parallel(
+        instances,
+        resume_single,
+        parallelism=parallelism,
+        action_name="instance resume",
+    )
+
+    for idx, instance in enumerate(instances):
+        if idx in errors:
+            logger.error(f"Failed to resume instance {instance.instance_id} ({instance.name}): {errors[idx]}")
+        elif resumed.get(idx):
             logger.info(f"Successfully resumed instance {instance.instance_id} ({instance.name})")
         else:
             logger.error(f"Failed to resume instance {instance.instance_id} ({instance.name})")
@@ -527,13 +669,6 @@ def resume_instances(
 
 
 @common_cli_options
-@click.option(
-    "-j",
-    "--parallelism",
-    type=click.IntRange(min=1),
-    default=None,
-    help="Maximum number of instances to run in parallel (default: all selected instances)",
-)
 def run_command(
     name: str,
     region: str,
@@ -551,19 +686,26 @@ def run_command(
     """
     Run a command or script on EC2 instances.
 
+    Targets running instances in the cluster, optionally narrows to explicit
+    instance IDs, and executes the command over SSH. Commands can run in detached
+    mode, execute in parallel with bounded worker count, and optionally append a
+    self-termination command to each instance after execution.
+
+    \f
+
     Args:
-        name: Project name to filter instances by
-        region: AWS region where instances are located
-        instance_id: Optional list of specific instance IDs to run command on
-        command: Command string to execute on instances
-        script: Path to script file to execute on instances
-        ssh_key_path: Path to SSH private key for authentication
-        detach: Whether to run command in detached mode (via screen)
-        spindown: Whether to self-terminate the instance after the command completes
-        instance_username: SSH username for connecting to instances
-        parallelism: Maximum number of instances to run in parallel
-        timeout: Optional timeout in seconds for command execution
-        **kwargs: Additional keyword arguments
+        name: Cluster name used to select instances via the `Project` tag.
+        region: AWS region where commands are executed.
+        instance_id: Optional instance IDs to target.
+        command: Shell command to run remotely; mutually exclusive with `script`.
+        script: Local script path to upload/run; mutually exclusive with `command`.
+        ssh_key_path: Path to the local private SSH key for authentication.
+        detach: If `True`, run in detached mode via the `Session` backend.
+        spindown: If `True`, append EC2 terminate command after the main command.
+        instance_username: Username used for SSH connections.
+        parallelism: Maximum number of concurrent remote executions.
+        timeout: Optional per-instance command timeout in seconds.
+        **kwargs: Additional CLI options injected by shared decorators; ignored here.
     """
     logger.info(f"Running command on instances with project={name} in region {region}")
 
@@ -654,16 +796,22 @@ def setup_instances(
     **kwargs,
 ):
     """
-    Set up AWS credentials on EC2 instances and install GNU screen.
+    Configure base runtime prerequisites on EC2 instances.
+
+    Reads local AWS credentials, writes `~/.aws/config` and
+    `~/.aws/credentials` on target instances, and installs GNU `screen`. This is
+    the shared bootstrap step used by higher-level setup commands.
+
+    \f
 
     Args:
-        name: Project name to filter instances by
-        region: AWS region where instances are located
-        owner: Owner name for logging
-        instance_id: Optional list of specific instance IDs to set up
-        ssh_key_path: Path to SSH private key for authentication
-        instance_username: SSH username for connecting to instances
-        **kwargs: Additional keyword arguments
+        name: Cluster name used to select instances via the `Project` tag.
+        region: AWS region where setup runs.
+        owner: Owner value used for logging and forwarded CLI compatibility.
+        instance_id: Optional instance IDs to bootstrap.
+        ssh_key_path: Path to the local private SSH key for authentication.
+        instance_username: Username used for SSH connections.
+        **kwargs: Additional CLI options injected by shared decorators; ignored here.
     """
     logger.info(f"Setting up AWS credentials on instances with project={name}, owner={owner} in region {region}")
 
@@ -726,16 +874,23 @@ def setup_dolma2_toolkit(
     **kwargs,
 ):
     """
-    Set up the Dolma2 toolkit on EC2 instances.
+    Install and configure the Dolma2 toolkit on EC2 instances.
+
+    Runs the base `setup` bootstrap first (AWS credentials and `screen`), then
+    executes the Dolma2 setup script on selected instances. The setup stage can be
+    detached so installation continues in the background.
+
+    \f
 
     Args:
-        name: Project name to filter instances by
-        region: AWS region to search in
-        owner: Owner name to filter instances by
-        instance_id: Optional list of specific instance IDs to target
-        ssh_key_path: Path to SSH private key file
-        detach: Whether to run setup in detached mode
-        **kwargs: Additional keyword arguments
+        name: Cluster name used to select instances via the `Project` tag.
+        region: AWS region where setup runs.
+        owner: Owner value used for logging and forwarded CLI compatibility.
+        instance_id: Optional instance IDs to configure.
+        ssh_key_path: Path to the local private SSH key for authentication.
+        detach: If `True`, run toolkit setup commands in detached mode.
+        instance_username: Username used for SSH connections.
+        **kwargs: Additional CLI options injected by shared decorators; ignored here.
     """
     setup_instances(
         name=name,
@@ -783,16 +938,23 @@ def setup_dolma_python(
     **kwargs,
 ):
     """
-    Set up the Dolma Python on EC2 instances.
+    Install and configure Dolma Python on EC2 instances.
+
+    Runs the base `setup` bootstrap first (AWS credentials and `screen`), then
+    executes the Dolma Python setup script on selected instances. The setup stage
+    can be detached so installation continues in the background.
+
+    \f
 
     Args:
-        name: Project name to filter instances by
-        region: AWS region to search in
-        owner: Owner name to filter instances by
-        instance_id: Optional list of specific instance IDs to target
-        ssh_key_path: Path to SSH private key file
-        detach: Whether to run setup in detached mode
-        **kwargs: Additional keyword arguments
+        name: Cluster name used to select instances via the `Project` tag.
+        region: AWS region where setup runs.
+        owner: Owner value used for logging and forwarded CLI compatibility.
+        instance_id: Optional instance IDs to configure.
+        ssh_key_path: Path to the local private SSH key for authentication.
+        detach: If `True`, run setup commands in detached mode.
+        instance_username: Username used for SSH connections.
+        **kwargs: Additional CLI options injected by shared decorators; ignored here.
     """
     setup_instances(
         name=name,
@@ -848,17 +1010,24 @@ def setup_decon(
     **kwargs,
 ):
     """
-    Set up the DECON toolkit on EC2 instances.
+    Install and configure DECON on EC2 instances.
+
+    Runs the base `setup` bootstrap first, then builds a per-instance DECON setup
+    script with host index metadata so workers can coordinate distributed work. The
+    optional GitHub token is used when private repository access is required.
+
+    \f
 
     Args:
-        name: Project name to filter instances by
-        region: AWS region to search in
-        owner: Owner name to filter instances by
-        instance_id: Optional list of specific instance IDs to target
-        ssh_key_path: Path to SSH private key file
-        detach: Whether to run setup in detached mode
-        github_token: GitHub personal access token for cloning private repos (e.g. allenai/decon)
-        **kwargs: Additional keyword arguments
+        name: Cluster name used to select instances via the `Project` tag.
+        region: AWS region where setup runs.
+        owner: Owner value used for logging and forwarded CLI compatibility.
+        instance_id: Optional instance IDs to configure.
+        ssh_key_path: Path to the local private SSH key for authentication.
+        detach: If `True`, run setup commands in detached mode.
+        github_token: Optional GitHub token for cloning private repositories.
+        instance_username: Username used for SSH connections.
+        **kwargs: Additional CLI options injected by shared decorators; ignored here.
     """
     setup_instances(
         name=name,
@@ -922,19 +1091,22 @@ def map_commands(
     """
     Distribute scripts across EC2 instances and run them in parallel.
 
-    Scripts are shuffled and split evenly across instances. Each instance gets a
-    ``run_all.sh`` that executes its assigned scripts sequentially, with progress
-    logged to ``run_all.log``. Execution happens in detached screen sessions.
+    Script inputs are shuffled (with a fixed seed), split approximately evenly
+    across selected instances, copied over SSH, and wrapped in a per-instance
+    `run_all.sh`. Each wrapper is then started in detached mode so all instances
+    process their assigned scripts concurrently.
+
+    \f
 
     Args:
-        name: Project name to filter instances by
-        region: AWS region to search in
-        instance_id: Optional list of specific instance IDs to target
-        ssh_key_path: Path to SSH private key file
-        script: List of script paths to distribute and execute
-        spindown: Whether to stop instances after their scripts complete
-        instance_username: SSH username for connecting to instances
-        **kwargs: Additional keyword arguments
+        name: Cluster name used to select instances via the `Project` tag.
+        region: AWS region where scripts are dispatched.
+        instance_id: Optional instance IDs to target.
+        ssh_key_path: Path to the local private SSH key for authentication.
+        script: Executable script paths to distribute across instances.
+        spindown: If `True`, append an EC2 stop command to each wrapper script.
+        instance_username: Username used for SSH connections.
+        **kwargs: Additional CLI options injected by shared decorators; ignored here.
     """
     random.seed(42)
     assert isinstance(script, list) and len(script) > 0, "script must be a list with at least one script"
@@ -1047,20 +1219,24 @@ def wait_instances(
     """
     Wait until all instances in a cluster are ready.
 
-    Polls EC2 instance status and optionally runs a readiness command via SSH.
-    Shows a spinner animation while waiting and reports progress for multi-instance clusters.
+    Polls EC2 status checks until all selected instances are running and healthy.
+    Optionally runs a readiness command/script over SSH for each instance and only
+    reports success when that command exits cleanly everywhere. Progress is shown
+    interactively with a spinner until all instances are ready or timeout is hit.
+
+    \f
 
     Args:
-        name: Project name to filter instances by
-        region: AWS region where instances are located
-        instance_id: Optional list of specific instance IDs to wait for
-        ssh_key_path: Path to SSH private key for authentication
-        timeout: Optional timeout in seconds (default: wait indefinitely)
-        instance_username: Username for SSH connections
-        command: Optional command that must exit 0 for an instance to be considered ready
-        script: Optional script path that must exit 0 for an instance to be considered ready
-        poll_interval: Seconds between polling attempts (default: 10)
-        **kwargs: Additional keyword arguments
+        name: Cluster name used to select instances via the `Project` tag.
+        region: AWS region where instances are polled.
+        instance_id: Optional instance IDs to wait for.
+        ssh_key_path: Path to the local private SSH key for authentication.
+        timeout: Optional overall timeout in seconds; waits indefinitely if unset.
+        instance_username: Username used for SSH readiness checks.
+        command: Optional readiness command that must succeed on each instance.
+        script: Optional readiness script path that must succeed on each instance.
+        poll_interval: Polling interval in seconds between readiness checks.
+        **kwargs: Additional CLI options injected by shared decorators; ignored here.
     """
     ready_command: str | None = None
     if script is not None:
@@ -1096,7 +1272,15 @@ def wait_instances(
         total = len(instances)
 
         def check_instance(inst: InstanceInfo) -> tuple[InstanceInfo, bool]:
-            """Check if a single instance is healthy, including optional ready command."""
+            """
+            Check whether one instance is ready.
+
+            Args:
+                inst: Instance to evaluate.
+
+            Returns:
+                tuple[InstanceInfo, bool]: The original instance and its readiness status.
+            """
             all_checks = len(inst._status)
             ok_checks = sum(1 for _, s in inst._status if s == "ok")
             healthy = inst.state == InstanceStatus.RUNNING and all_checks > 0 and ok_checks == all_checks
@@ -1168,15 +1352,21 @@ def ssh_instance(
     **kwargs,
 ):
     """
-    SSH into an EC2 instance. If multiple instances match, prompts for selection.
+    Open an interactive SSH session to a running EC2 instance.
+
+    Finds running instances in the cluster, optionally filters by explicit
+    instance IDs, and prompts for selection when multiple candidates remain. The
+    current process is then replaced with a local `ssh` command.
+
+    \f
 
     Args:
-        name: Project name to filter instances by
-        region: AWS region where instances are located
-        instance_id: Optional list of specific instance IDs to target
-        ssh_key_path: Path to SSH private key for authentication
-        instance_username: SSH username for connecting to instances
-        **kwargs: Additional keyword arguments
+        name: Cluster name used to select instances via the `Project` tag.
+        region: AWS region where instances are queried.
+        instance_id: Optional instance IDs to allow as SSH targets.
+        ssh_key_path: Path to the local private SSH key for authentication.
+        instance_username: Username used for SSH connections.
+        **kwargs: Additional CLI options injected by shared decorators; ignored here.
     """
     client = ClientUtils.get_ec2_client(region=region)
 
