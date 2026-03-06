@@ -12,7 +12,7 @@ A minimal alternative to Ray for distributed data processing on EC2 instances. M
 
 ## Installation
 
-Requires Python 3.10+.
+Requires Python 3.12+.
 
 ```bash
 # Install as a CLI tool (recommended)

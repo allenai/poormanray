@@ -5,959 +5,40 @@ Poor Man's Ray
 CLI to start, stop, and manage EC2 instances as a minimal alternative to Ray for
 distributed data processing. Primarily designed for the Dolma toolkit ecosystem.
 
-Commands:
-    Cluster management:
-        create              Launch new EC2 instances
-        list                Display information about running instances
-        terminate           Shut down and remove instances
-        pause / resume      Stop and start instances (preserves EBS)
-        wait                Poll until instances are running and healthy
-        ssh                 Open an interactive SSH session to an instance
-
-    Command execution:
-        run                 Execute a command or script on instances
-        map                 Distribute scripts across instances for parallel execution
-
-    Instance setup:
-        setup               Configure AWS credentials (and install screen)
-        setup-d2tk          Install and configure the Dolma2 toolkit
-        setup-dolma-python  Install Python 3.12, uv, and the dolma package
-        setup-decon         Install the DECON pipeline with Rust toolchain
-
-    Misc:
-        version             Print the installed version
-
-Examples::
-
-    pmr create --name mycluster --number 5 --instance-type i4i.2xlarge
-    pmr wait --name mycluster
-    pmr setup --name mycluster
-    pmr run --name mycluster --command "echo hello"
-    pmr map --name mycluster --script ./jobs/
-    pmr ssh --name mycluster
-    pmr terminate --name mycluster
-
 Author: Luca Soldaini
 Email: luca@soldaini.net
 """
 
 import base64
-import datetime
-import hashlib
 import json
 import logging
 import os
 import random
 import re
-import subprocess
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
-from enum import Enum
 from functools import partial, reduce
-from typing import TYPE_CHECKING, Callable, Optional, TypeVar, Union
+from typing import Callable, TypeVar
 
-import boto3
 import click
 
-if TYPE_CHECKING:
-    from mypy_boto3_ec2.client import EC2Client
-    from mypy_boto3_ec2.type_defs import InstanceStatusTypeDef, InstanceTypeDef
-    from mypy_boto3_ssm.client import SSMClient
-
+from . import logger
+from .commands import (
+    D2TK_SETUP,
+    DOLMA_PYTHON_SETUP,
+    PACKAGE_MANAGER_DETECTOR,
+    make_decon_python_setup,
+)
+from .ec2_instance import ClientUtils, InstanceInfo, InstanceStatus
+from .ssh_session import Session, import_ssh_key_to_ec2
 from .utils import (
     get_aws_access_key_id,
     get_aws_secret_access_key,
     make_aws_config,
     make_aws_credentials,
+    script_to_command,
 )
-
-
-def setup_logging():
-    logger = logging.getLogger(__name__)
-    logger.setLevel(logging.INFO)
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
-    formatter = logging.Formatter("[%(levelname)s][%(asctime)s] %(message)s", datefmt="%H:%M:%S")
-    console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
-    return logger
-
-
-logger = setup_logging()
-
-
-PACKAGE_MANAGER_DETECTOR = """
-#!/bin/bash
-
-# Determine package manager based on OS information in /etc/os-release
-determine_package_manager() {
-  # Source the OS release file to get variables
-  source /etc/os-release
-
-  # First try using ID_LIKE if available
-  if [[ -n "$ID_LIKE" ]]; then
-    # Debian-based systems
-    if [[ "$ID_LIKE" == *"debian"* ]]; then
-      echo "apt"
-      return
-    # Red Hat / Fedora based systems
-    elif [[ "$ID_LIKE" == *"fedora"* || "$ID_LIKE" == *"rhel"* ]]; then
-      if command -v dnf &>/dev/null; then
-        echo "dnf"
-      else
-        echo "yum"
-      fi
-      return
-    # SUSE-based systems
-    elif [[ "$ID_LIKE" == *"suse"* ]]; then
-      echo "zypper"
-      return
-    fi
-  fi
-
-  # Fall back to ID if ID_LIKE didn't match or isn't available
-  case "$ID" in
-    debian|ubuntu|mint|pop|elementary|zorin|kali|parrot|deepin)
-      echo "apt"
-      ;;
-    fedora)
-      echo "dnf"
-      ;;
-    rhel|centos)
-      if command -v dnf &>/dev/null; then
-        echo "dnf"
-      else
-        echo "yum"
-      fi
-      ;;
-    amzn)
-      if [[ "$VERSION_ID" == "2023"* ]]; then
-        echo "dnf"
-      else
-        echo "yum"
-      fi
-      ;;
-    opensuse*|sles|suse)
-      echo "zypper"
-      ;;
-    alpine)
-      echo "apk"
-      ;;
-    arch|manjaro|endeavouros)
-      echo "pacman"
-      ;;
-    *)
-      echo "unknown"
-      ;;
-  esac
-}
-
-# Get and display the package manager
-PKG_MANAGER=$(determine_package_manager)
-"""
-
-
-D2TK_SETUP = f"""
-#!/bin/bash
-
-{PACKAGE_MANAGER_DETECTOR}
-
-
-# Set up local NVMe drives (RAID0 if multiple, direct mount if single)
-NUM_DRIVES=$(echo "$(ls /dev/nvme*n1 | wc -l) - 1" | bc)
-sudo mkdir -p /mnt/raid0
-if [ "$NUM_DRIVES" -gt 1 ]; then
-  sudo yum install mdadm -y
-  MDADM_CMD="sudo mdadm --create /dev/md0 --level=0 --raid-devices=$NUM_DRIVES"
-  for i in $(seq 1 $NUM_DRIVES); do
-    MDADM_CMD="$MDADM_CMD /dev/nvme${{i}}n1"
-  done
-  eval $MDADM_CMD
-  sudo mkfs.xfs /dev/md0
-  sudo mount /dev/md0 /mnt/raid0
-elif [ "$NUM_DRIVES" -eq 1 ]; then
-  sudo mkfs.xfs /dev/nvme1n1
-  sudo mount /dev/nvme1n1 /mnt/raid0
-else
-  echo "No additional NVMe drives found, skipping drive setup"
-fi
-sudo chown -R $USER /mnt/raid0
-
-# Download and set up all packages we need
-sudo "${{PKG_MANAGER}}" update
-sudo "${{PKG_MANAGER}}" install gcc cmake openssl-devel gcc-c++ htop wget tmux screen git python3.12 python3.12-pip -y
-
-# Install S5CMD
-wget https://github.com/peak/s5cmd/releases/download/v2.2.2/s5cmd_2.2.2_Linux-64bit.tar.gz
-tar -xvzf s5cmd_2.2.2_Linux-64bit.tar.gz
-sudo mv s5cmd /usr/local/bin
-
-# Install Rust
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs > rustup.sh
-bash rustup.sh -y
-source ~/.bashrc
-
-# Setup datamap-rs
-cd
-git clone https://github.com/allenai/datamap-rs.git
-cd datamap-rs
-s5cmd run examples/all_dressed/s5cmd_asset_downloader.txt
-cargo build --release
-
-# Setup duplodocus (nee minhash-rs)
-cd
-git clone https://github.com/allenai/duplodocus.git
-cd duplodocus
-cargo build --release
-
-# install github cli
-curl -sS https://webi.sh/gh | sh
-
-# Install uv via pip
-pip3.12 install uv
-""".strip()
-
-
-DOLMA_PYTHON_SETUP = f"""
-#!/bin/bash
-{PACKAGE_MANAGER_DETECTOR}
-
-set -ex
-
-# install python 3.12 with pip
-sudo "${{PKG_MANAGER}}" update
-sudo "${{PKG_MANAGER}}" install python3.12 python3.12-pip -y
-
-# install git, tmux, htop
-sudo "${{PKG_MANAGER}}" install git tmux htop -y
-
-# install gcc, g++, cmake, openssl-devel
-sudo "${{PKG_MANAGER}}" install gcc g++ cmake openssl-devel -y
-
-# install github cli
-curl -sS https://webi.sh/gh | sh
-
-# install s5cmd
-wget https://github.com/peak/s5cmd/releases/download/v2.2.2/s5cmd_2.2.2_Linux-64bit.tar.gz
-tar -xvzf s5cmd_2.2.2_Linux-64bit.tar.gz
-sudo mv s5cmd /usr/local/bin/
-
-# install uv via pip
-pip3.12 install uv
-
-# make virtual environment, install dolma
-uv python install 3.12
-uv venv
-uv pip install dolma
-""".strip()
-
-
-def make_decon_python_setup(
-    github_token: str | None = None, host_index: int | None = None, host_count: int | None = None
-) -> str:
-    """Generate the DECON Python setup script with optional GitHub token and PMR environment variables."""
-    clone_cmd = "git clone https://github.com/allenai/decon.git"
-    if github_token:
-        clone_cmd = f"git clone https://{github_token}@github.com/allenai/decon.git"
-
-    # Add PMR environment setup if host_index and host_count are provided
-    pmr_setup = ""
-    if host_index is not None and host_count is not None:
-        pmr_setup = f"""
-# Set up PMR environment variables
-if ! grep -q "PMR_HOST_INDEX" /etc/environment; then
-    echo "PMR_HOST_INDEX={host_index}" | sudo tee -a /etc/environment
-    echo "PMR_HOST_COUNT={host_count}" | sudo tee -a /etc/environment
-fi
-export PMR_HOST_INDEX={host_index}
-export PMR_HOST_COUNT={host_count}
-"""
-
-    return f"""
-#!/bin/bash
-{PACKAGE_MANAGER_DETECTOR}
-
-# Set up drives
-TOTAL_DRIVES=$(ls /dev/nvme*n1 | wc -l)
-
-if [ $TOTAL_DRIVES -eq 1 ]; then
-    echo "No instance store drives found, only root drive exists"
-elif [ $TOTAL_DRIVES -eq 2 ]; then
-    # Single instance store drive - format as ext4 and mount directly
-    echo "Found single instance store drive, formatting as ext4 and mounting"
-    sudo mkfs.ext4 /dev/nvme1n1
-    sudo mkdir -p /mnt/decon-work
-    sudo mount /dev/nvme1n1 /mnt/decon-work
-    sudo chown -R $USER /mnt/decon-work
-else
-    # Multiple instance store drives - create RAID array first
-    echo "Found multiple instance store drives, creating RAID array"
-    sudo yum install mdadm -y
-    NUM_DRIVES=$((TOTAL_DRIVES - 1))
-    MDADM_CMD="sudo mdadm --create /dev/md0 --level=0 --raid-devices=$NUM_DRIVES"
-    for i in $(seq 1 $NUM_DRIVES); do
-        MDADM_CMD="$MDADM_CMD /dev/nvme${{i}}n1"
-    done
-    eval $MDADM_CMD
-    sudo mkfs.ext4 /dev/md0
-    sudo mkdir -p /mnt/decon-work
-    sudo mount /dev/md0 /mnt/decon-work
-    sudo chown -R $USER /mnt/decon-work
-fi
-
-
-set -ex
-{pmr_setup}
-# install python 3.12 with pip
-sudo "${{PKG_MANAGER}}" update
-sudo "${{PKG_MANAGER}}" install python3.12 python3.12-pip -y
-
-# create symlink from /usr/bin/python to python3.12
-sudo ln -sf /usr/bin/python3.12 /usr/bin/python
-sudo ln -sf /usr/bin/pip3.12 /usr/bin/pip
-
-# install git, tmux, htop
-sudo "${{PKG_MANAGER}}" install git tmux htop -y
-
-# install gcc, g++, cmake, openssl-devel
-sudo "${{PKG_MANAGER}}" install gcc g++ cmake openssl-devel -y
-
-# install s5cmd
-wget https://github.com/peak/s5cmd/releases/download/v2.2.2/s5cmd_2.2.2_Linux-64bit.tar.gz
-tar -xvzf s5cmd_2.2.2_Linux-64bit.tar.gz
-sudo mv s5cmd /usr/local/bin/
-
-# install rust
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs > rustup.sh
-bash rustup.sh -y
-source ~/.bashrc
-
-cd
-{clone_cmd}
-cd decon
-cargo build --release
-pip install -r python/requirements.txt
-
-make evals-s3
-""".strip()
-
-
-# Keep the default for backward compatibility
-DECON_PYTHON_SETUP = make_decon_python_setup()
-
-
-class ClientUtils:
-    @staticmethod
-    def get_ec2_client(
-        region: str = "us-east-1",
-        profile_name: str | None = None,
-    ) -> Union["EC2Client", None]:
-        """
-        Get a boto3 client for the specified service and region.
-        """
-        session = boto3.Session(profile_name=os.getenv("AWS_PROFILE", profile_name))
-        return session.client("ec2", region_name=region)  # type: ignore
-
-    @staticmethod
-    def get_ssm_client(
-        region: str = "us-east-1",
-        profile_name: str | None = None,
-    ) -> Union["SSMClient", None]:
-        """
-        Get a boto3 SSM client for the specified region.
-        """
-        session = boto3.Session(profile_name=os.getenv("AWS_PROFILE", profile_name))
-        return session.client("ssm", region_name=region)  # type: ignore
-
-
-class InstanceStatus(Enum):
-    PENDING = "pending"
-    RUNNING = "running"
-    SHUTTING_DOWN = "shutting-down"
-    TERMINATED = "terminated"
-    STOPPING = "stopping"
-    STOPPED = "stopped"
-
-    @classmethod
-    def active(cls) -> list["InstanceStatus"]:
-        return [
-            status
-            for status in cls
-            if status != cls.TERMINATED and status != cls.STOPPED and status != cls.SHUTTING_DOWN
-        ]
-
-    @classmethod
-    def unterminated(cls) -> list["InstanceStatus"]:
-        return [status for status in cls if status != cls.TERMINATED and status != cls.SHUTTING_DOWN]
-
-
-DEFAULT_PRIVATE_KEY_NAMES = [
-    "id_rsa",  # RSA (deprecated and not generated by default on many systems)
-    "id_ecdsa",  # ECDSA
-    "id_ecdsa_sk",  # ECDSA with FIDO/U2F
-    "id_ed25519",  # Ed25519
-    "id_ed25519_sk",  # Ed25519 with FIDO/U2F
-]
-
-
-from .session import Session  # noqa: E402
-
-
-@dataclass
-class InstanceInfo:
-    """
-    Represents information about an EC2 instance.
-
-    This class encapsulates all relevant details about an EC2 instance and provides
-    methods for instance management operations like creation, description, and termination.
-
-    Attributes:
-        instance_id: The unique identifier for the EC2 instance
-        instance_type: The type of the instance (e.g., t2.micro, m5.large)
-        image_id: The AMI ID used to launch the instance
-        state: Current state of the instance (e.g., running, stopped)
-        public_ip_address: The public IP address assigned to the instance
-        public_dns_name: The public DNS name assigned to the instance
-        name: The Name tag value of the instance
-        tags: Dictionary of all tags applied to the instance
-        zone: The availability zone where the instance is running
-        region: The AWS region where the instance is located
-    """
-
-    instance_id: str
-    instance_type: str
-    image_id: str
-    state: InstanceStatus
-    public_ip_address: str
-    public_dns_name: str
-    name: str
-    tags: dict[str, str]
-    zone: str
-    created_at: datetime.datetime
-    region: str = "us-east-1"
-
-    def __post_init__(self):
-        self._status: list[tuple[str, str]] = []
-
-    def _update_status(self, name: str, status: str):
-        self._status.append((name, status))
-
-    @property
-    def checks(self) -> str:
-        all_status = len(self._status)
-        all_ok = sum(1 for _, status in self._status if status == "ok")
-        return f"{all_ok}/{all_status}"
-
-    @property
-    def pretty_checks(self) -> str:
-        if len(self._status) == 0:
-            # bracket text in yellow
-            start, end = "\033[93m", "\033[0m"
-        elif sum(1 for _, status in self._status if status == "ok") == len(self._status):
-            # bracket text in green
-            start, end = "\033[92m", "\033[0m"
-        else:
-            # bracket text in red
-            start, end = "\033[91m", "\033[0m"
-
-        return f"{start}{self.checks}{end}"
-
-    @property
-    def pretty_state(self) -> str:
-        if self.state == InstanceStatus.RUNNING:
-            # bracket text in green
-            start, end = "\033[92m", "\033[0m"
-        elif self.state == InstanceStatus.PENDING:
-            # bracket text in blue
-            start, end = "\033[94m", "\033[0m"
-        elif self.state == InstanceStatus.SHUTTING_DOWN:
-            # bracket text in red
-            start, end = "\033[91m", "\033[0m"
-        else:
-            # bracket text in yellow
-            start, end = "\033[93m", "\033[0m"
-
-        return f"{start}{self.state.value}{end}"
-
-    @property
-    def pretty_id(self) -> str:
-        return f"\033[1m{self.instance_id}\033[0m"
-
-    @property
-    def pretty_ip(self) -> str:
-        # make the ip address italic
-        return f"\033[3m{self.public_ip_address or '·'}\033[0m"
-
-    @classmethod
-    def from_instance(
-        cls,
-        description: Union[dict, "InstanceTypeDef"],
-        status: Optional[Union[dict, "InstanceStatusTypeDef"]] = None,
-    ) -> "InstanceInfo":
-        """
-        Creates an InstanceInfo object from an EC2 instance dictionary.
-
-        Args:
-            instance: Dictionary containing EC2 instance details or boto3 InstanceTypeDef
-
-        Returns:
-            An InstanceInfo object populated with the instance details
-        """
-        name = str(next((tag.get("Value") for tag in description.get("Tags", []) if tag.get("Key") == "Name"), ""))
-
-        instance = cls(
-            instance_id=description.get("InstanceId", ""),
-            instance_type=description.get("InstanceType", ""),
-            image_id=description.get("ImageId", ""),
-            state=InstanceStatus(description.get("State", {}).get("Name", "")),
-            public_ip_address=description.get("PublicIpAddress", ""),
-            public_dns_name=description.get("PublicDnsName", ""),
-            name=name,
-            created_at=description.get("LaunchTime", datetime.datetime.min),
-            tags={tag["Key"]: tag.get("Value", "") for tag in description.get("Tags", []) if "Key" in tag},
-            zone=description.get("Placement", {}).get("AvailabilityZone", ""),
-        )
-
-        for instance_status, instance_value in (status or {}).items():
-            if instance_status.endswith("Status"):
-                assert isinstance(instance_value, dict), f"{instance_value} is {type(instance_value)}, not dict"
-                instance._update_status(name=instance_status, status=instance_value.get("Status", ""))
-        return instance
-
-    @classmethod
-    def describe_instances(
-        cls,
-        instance_ids: list[str] | None = None,
-        client: Union["EC2Client", "SSMClient", None] = None,
-        region: str | None = None,
-        project: str | None = None,
-        owner: str | None = None,
-        contact: str | None = None,
-        statuses: list["InstanceStatus"] | None = None,
-    ) -> list["InstanceInfo"]:
-        """
-        Retrieves information about multiple EC2 instances based on filters.
-
-        Args:
-            instance_ids: Optional list of instance IDs to filter by
-            client: Optional boto3 EC2 client to use
-            region: AWS region to query (defaults to class region)
-            project: Optional project tag to filter by
-            owner: Deprecated; use contact instead
-            contact: Optional contact tag to filter by
-            statuses: Optional list of instance statuses to include
-
-        Returns:
-            List of InstanceInfo objects matching the specified criteria
-        """
-
-        statuses = statuses or InstanceStatus.active()
-
-        client = client or ClientUtils.get_ec2_client(region=region or cls.region)
-        assert client, "EC2 client is required"
-
-        filters = []
-        filters.append({"Name": "instance-state-name", "Values": [status.value for status in statuses]})
-
-        if instance_ids:
-            filters.append({"Name": "instance-id", "Values": instance_ids})
-
-        if owner:
-            logger.warning("The owner tag is deprecated. Use the contact tag instead.")
-
-        if contact:
-            filters.append({"Name": "tag:Contact", "Values": [contact]})
-
-        if project:
-            filters.append({"Name": "tag:Project", "Values": [project]})
-
-        response_describe = client.describe_instances(  # pyright: ignore
-            **({"Filters": filters} if filters else {})
-        )
-
-        response_status = client.describe_instance_status(  # pyright: ignore
-            InstanceIds=[
-                id_
-                for reservation in response_describe.get("Reservations", [])
-                for instance in reservation.get("Instances", [])
-                if isinstance(id_ := instance.get("InstanceId"), str)
-            ]
-        )
-
-        instance_statuses = {
-            id_: status
-            for status in response_status.get("InstanceStatuses", [])
-            if isinstance((id_ := status.get("InstanceId")), str)
-        }
-
-        instances = [
-            InstanceInfo.from_instance(description=instance, status=instance_statuses.get(id_, None))
-            for reservation in response_describe.get("Reservations", [])
-            for instance in reservation.get("Instances", [])
-            if isinstance((id_ := instance.get("InstanceId")), str)
-        ]
-
-        return sorted(instances, key=lambda x: x.name)
-
-    @classmethod
-    def describe_instance(
-        cls,
-        instance_id: str,
-        client: Union["EC2Client", "SSMClient", None] = None,
-        region: str | None = None,
-    ) -> "InstanceInfo":
-        """
-        Retrieves detailed information about a specific EC2 instance.
-
-        Args:
-            instance_id: The ID of the instance to describe
-            client: Optional boto3 EC2 client to use
-            region: AWS region where the instance is located
-
-        Returns:
-            InstanceInfo object containing the instance details
-        """
-        client = client or ClientUtils.get_ec2_client(region=region or cls.region)
-        assert client, "EC2 client is required"
-
-        response = client.describe_instances(InstanceIds=[instance_id])
-        return InstanceInfo.from_instance(response.get("Reservations", [])[0].get("Instances", [])[0])
-
-    def pause(self, client: Union["EC2Client", None] = None, wait_for_completion: bool = True) -> bool:
-        """
-        Pauses this EC2 instance.
-
-        Args:
-            client: Optional boto3 EC2 client to use
-            wait_for_completion: If True, wait until the instance is fully paused
-
-        Returns:
-            True if pause was successful, False otherwise
-        """
-        client = client or ClientUtils.get_ec2_client(region=self.region)
-        assert client, "EC2 client is required"
-
-        if self.state == InstanceStatus.STOPPED:
-            logger.info(f"Instance {self.instance_id} ({self.name}) is already paused")
-            return True
-
-        try:
-            logger.info(f"Pausing instance {self.instance_id} ({self.name})...")
-            client.stop_instances(InstanceIds=[self.instance_id])
-
-            if wait_for_completion:
-                logger.info("Waiting for instance to be fully paused...")
-                waiter = client.get_waiter("instance_stopped")
-                waiter.wait(InstanceIds=[self.instance_id])
-                logger.info(f"Instance {self.instance_id} has been paused")
-
-            return True
-
-        except client.exceptions.ClientError as e:
-            logger.error(f"Error pausing instance {self.instance_id}: {str(e)}")
-            return False
-
-    def resume(self, client: Union["EC2Client", None] = None, wait_for_completion: bool = True) -> bool:
-        """
-        Resumes this EC2 instance.
-
-        Args:
-            client: Optional boto3 EC2 client to use
-            wait_for_completion: If True, wait until the instance is fully resumed
-
-        Returns:
-            True if resume was successful, False otherwise
-        """
-        client = client or ClientUtils.get_ec2_client(region=self.region)
-        assert client, "EC2 client is required"
-
-        if self.state == InstanceStatus.RUNNING:
-            logger.info(f"Instance {self.instance_id} ({self.name}) is already running")
-            return True
-
-        try:
-            logger.info(f"Resuming instance {self.instance_id} ({self.name})...")
-            client.start_instances(InstanceIds=[self.instance_id])
-
-            if wait_for_completion:
-                logger.info("Waiting for instance to be fully resumed...")
-                waiter = client.get_waiter("instance_running")
-                waiter.wait(InstanceIds=[self.instance_id])
-                logger.info(f"Instance {self.instance_id} has been resumed")
-
-            return True
-
-        except client.exceptions.ClientError as e:
-            logger.error(f"Error resuming instance {self.instance_id}: {str(e)}")
-            return False
-
-    def terminate(self, client: Union["EC2Client", None] = None, wait_for_termination: bool = True) -> bool:
-        """
-        Terminates this EC2 instance.
-
-        Args:
-            client: Optional boto3 EC2 client to use
-            wait_for_termination: If True, wait until the instance is fully terminated
-
-        Returns:
-            True if termination was successful, False otherwise
-        """
-        client = client or ClientUtils.get_ec2_client(region=self.region)
-        assert client, "EC2 client is required"
-
-        try:
-            logger.info(f"Terminating instance {self.instance_id} ({self.name})...")
-            client.terminate_instances(InstanceIds=[self.instance_id])
-
-            if wait_for_termination:
-                logger.info("Waiting for instance to be fully terminated...")
-                waiter = client.get_waiter("instance_terminated")
-                waiter.wait(InstanceIds=[self.instance_id])
-                logger.info(f"Instance {self.instance_id} has been terminated")
-
-            return True
-
-        except client.exceptions.ClientError as e:
-            error_code = e.response.get("Error", {}).get("Code", "Unknown")
-            if error_code == "InvalidInstanceID.NotFound":
-                logger.info(f"Instance {self.instance_id} not found in region {self.region}")
-            else:
-                logger.error(f"Error terminating instance {self.instance_id}: {str(e)}")
-            return False
-
-    @classmethod
-    def get_latest_ami_id(
-        cls, instance_type: str, client: Union["SSMClient", None] = None, region: str | None = None
-    ) -> str:
-        """
-        Get the latest AMI ID for a given instance type and region
-        """
-        is_arm = instance_type.startswith(("a1", "c6g", "c7g", "m6g", "m7g", "r6g", "r7g", "t4g", "im4gn", "g5g"))
-
-        # Select appropriate AMI based on architecture
-        if is_arm:
-            image_id = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64"
-        else:
-            image_id = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"
-
-        client = client or ClientUtils.get_ssm_client(region=region or cls.region)
-        assert client, "SSM client is required"
-
-        parameter = client.get_parameter(Name=image_id, WithDecryption=False)
-        ami_id = parameter.get("Parameter", {}).get("Value")
-        assert ami_id, f"No AMI ID found for {image_id}"
-        return ami_id
-
-    @classmethod
-    def create_instance(
-        cls,
-        instance_type: str,
-        tags: dict[str, str],
-        region: str,
-        zone: str | None = None,
-        ami_id: str | None = None,
-        wait_for_completion: bool = True,
-        key_name: str | None = None,
-        storage_type: str | None = None,
-        storage_size: int | None = None,
-        storage_iops: int | None = None,
-        client: Union["EC2Client", None] = None,
-    ) -> "InstanceInfo":
-        """
-        Creates a new EC2 instance and waits until it's running.
-
-        Args:
-            instance_type: The EC2 instance type (e.g., 't2.micro')
-            tags: Dictionary of tags to apply to the instance
-            region: AWS region where to launch the instance
-            zone: AWS availability zone where to launch the instance
-            ami_id: AMI ID to use (defaults to Amazon Linux 2 in the specified region)
-            wait_for_completion: Whether to wait for the instance to be running
-            key_name: Name of the key pair to use for SSH access to the instance
-            storage_type: Type of EBS storage (e.g., 'gp2', 'gp3'). If None, uses AWS default
-            storage_size: Size of root volume in GB. If None, uses AWS default
-            storage_iops: IOPS for the root volume. If None, uses AWS default
-            client: Optional boto3 EC2 client to use
-
-        Returns:
-            InstanceInfo object representing the newly created EC2 instance
-        """
-        client = client or ClientUtils.get_ec2_client(region=region)
-        assert client, "EC2 client is required"
-
-        vpcs = client.describe_vpcs()["Vpcs"]
-        vpc_id = vpcs[0].get("VpcId")
-
-        if vpc_id is None:
-            raise ValueError("No VPC ID found in VPC: {}".format(vpcs[0]))
-
-        print(f"Using VPC ID: {vpc_id}")
-
-        ami_id = ami_id or cls.get_latest_ami_id(instance_type=instance_type, region=region)
-
-        tag_specifications = [
-            {"ResourceType": "instance", "Tags": [{"Key": key, "Value": value} for key, value in tags.items()]}
-        ]
-
-        launch_params = {
-            "ImageId": ami_id,
-            "InstanceType": instance_type,
-            "MinCount": 1,
-            "MaxCount": 1,
-            "TagSpecifications": tag_specifications,
-        }
-
-        if zone:
-            launch_params["Placement"] = {"AvailabilityZone": zone}
-
-        if key_name:
-            launch_params["KeyName"] = key_name
-
-        if storage_size is not None:
-            launch_params.update(
-                {
-                    "BlockDeviceMappings": [
-                        {
-                            "DeviceName": "/dev/xvda",
-                            "Ebs": {
-                                "DeleteOnTermination": True,
-                                "VolumeSize": storage_size,
-                                **({"VolumeType": storage_type} if storage_type else {}),
-                                **({"Iops": storage_iops} if storage_iops else {}),
-                            },
-                        }
-                    ]
-                }
-            )
-
-        response = client.run_instances(**launch_params)
-
-        if (instance_def := next(iter(response["Instances"]), None)) is None:
-            raise Exception("No instance created")
-        else:
-            instance = InstanceInfo.from_instance(instance_def)
-
-        logger.info(f"Created instance {instance.instance_id}")
-
-        if wait_for_completion:
-            logger.info("Waiting for instance to enter 'running' state...")
-            waiter = client.get_waiter("instance_running")
-            waiter.wait(InstanceIds=[instance.instance_id])
-
-            logger.info("Instance is running. Waiting for status checks to pass...")
-            waiter = client.get_waiter("instance_status_ok")
-            waiter.wait(InstanceIds=[instance.instance_id])
-            logger.info(f"Instance {instance.instance_id} is now available and ready to use")
-
-        return instance
-
-
-def import_ssh_key_to_ec2(key_name: str, region: str, private_key_path: str) -> str:
-    """
-    Imports an SSH public key to EC2 as a key pair.
-
-    Args:
-        key_name: The name to assign to the key pair in EC2
-        region: AWS region where to import the key
-        private_key_path: Path to the SSH private key file (defaults to ~/.ssh/id_rsa)
-
-    Returns:
-        The key pair ID if the import was successful.
-    """
-    client = ClientUtils.get_ec2_client(region=region)
-    assert client, "EC2 client is required"
-
-    if not private_key_path:
-        home_dir = os.path.expanduser("~")
-        for key_name in DEFAULT_PRIVATE_KEY_NAMES:
-            private_key_path = os.path.join(home_dir, ".ssh", key_name)
-            if os.path.isfile(private_key_path):
-                break
-
-    if not os.path.isfile(private_key_path):
-        raise ValueError(f"Private key file not found at {private_key_path}")
-
-    try:
-        with open(private_key_path, "r") as key_file:
-            private_key_material = key_file.read().strip()
-
-        # Derive public key from private key via ssh-keygen
-        ssh_public_key_path = f"{private_key_path}.pub"
-        try:
-            subprocess.run(
-                ["ssh-keygen", "-y", "-f", private_key_path],
-                check=True,
-                stdout=open(ssh_public_key_path, "w"),
-                stderr=subprocess.PIPE,
-            )
-            with open(ssh_public_key_path, "r") as pub_key_file:
-                public_key_material = pub_key_file.read().strip()
-        except subprocess.CalledProcessError as e:
-            raise ValueError(f"Failed to generate public key: {e.stderr.decode()}")
-
-        logger.info(f"Generated public key from private key and saved to {ssh_public_key_path}")
-    except Exception as e:
-        logger.error(f"Failed to generate public key from private key: {str(e)}")
-        raise ValueError(f"Could not generate public key from private key: {str(e)}")
-
-    # Build a deterministic key name from hashes of both private and public material
-    h = hashlib.sha256(private_key_material.encode()).hexdigest()
-    key_name = f"{key_name}-{h}"
-
-    with open(ssh_public_key_path, "r") as key_file:
-        public_key_material = key_file.read().strip()
-
-    h = hashlib.sha256(public_key_material.encode()).hexdigest()
-    key_name = f"{key_name}-{h}"
-
-    try:
-        try:
-            client.describe_key_pairs(KeyNames=[key_name])
-            logger.info(f"Key pair '{key_name}' already exists in region {region}. Skipping import.")
-            return key_name
-        except client.exceptions.ClientError:
-            pass
-
-        response = client.import_key_pair(KeyName=key_name, PublicKeyMaterial=public_key_material)
-
-        if response["KeyFingerprint"] is None:
-            raise ValueError(f"Failed to import key pair '{key_name}' to region {region}")
-
-        logger.info(f"Successfully imported key pair '{key_name}' to region {region}")
-        return key_name
-
-    except Exception as e:
-        logger.error(f"Error importing SSH key: {str(e)}")
-        raise e
-
-
-def script_to_command(script_path: str, to_file: bool = True) -> str:
-    """
-    Convert a script to a command that can be executed on an EC2 instance.
-
-    Args:
-        script_path: Path to the script to convert
-        to_file: Whether to save the script to a file and run it from there
-
-    Returns:
-        The command to execute the script on the EC2 instance
-    """
-    assert os.path.isfile(script_path), f"Script file not found: {script_path}"
-
-    with open(script_path, "rb") as f:
-        script_content = f.read()
-
-    b64_script_content = base64.b64encode(script_content).decode()
-
-    if to_file:
-        file_name, extension = os.path.splitext(os.path.basename(script_path))
-        h = hashlib.sha256(script_content).hexdigest()
-        script_path = f"{file_name}-{h}{extension}"
-        return f"echo '{b64_script_content}' | base64 -d > {script_path} && chmod +x {script_path} && bash {script_path}"
-    else:
-        return f"echo {b64_script_content} | base64 -d | bash"
 
 
 @click.group()
@@ -1004,8 +85,64 @@ def common_cli_options(f: T) -> T:
                 raise click.UsageError("Cannot provide both --command and --script")
             return value
 
+    def parse_project_name(ctx: click.Context, param: click.Parameter, value: str | None) -> str | None:
+        if param.name == "name":
+            if value is None:
+                raise click.UsageError("Cluster name must be provided")
+
+            try:
+                value = str(value).strip()
+            except ValueError:
+                raise click.UsageError("Cluster name must be a string")
+
+            if not value:
+                raise click.UsageError("Cluster name must be a non-empty string")
+
+            if "@" in value:
+                if ctx.params.get("project", None) is not None:
+                    raise click.UsageError("Name cannot contain '@' when --project is provided")
+
+                cluster, project = value.split("@", 1)
+                ctx.params.setdefault("project", project)
+                return cluster
+
+            return value
+
+        elif param.name == "project":
+            if value is not None:
+                if ctx.params.get("project", None) is not None:
+                    raise click.UsageError("Name cannot contain '@' when --project is provided")
+                try:
+                    value = str(value).strip()
+                except ValueError:
+                    raise click.UsageError("Cluster name must be a string")
+
+                if not value:
+                    raise click.UsageError("Cluster name must be a non-empty string")
+
+            elif ctx.params.get("project", None) is None and "@" not in ctx.params.get("name", ""):
+                logger.warning(
+                    "--name does not contain '@' and --project is not provided. This might result in errors."
+                )
+            return value
+
     click_decorators = [
-        click.option("-n", "--name", type=str, required=True, help="Cluster name"),
+        click.option(
+            "-n",
+            "--name",
+            type=str,
+            required=True,
+            help="Cluster name",
+            callback=parse_project_name,
+        ),
+        click.option(
+            "-p",
+            "--project",
+            type=str,
+            default=None,
+            callback=parse_project_name,
+            help="Ai2 project name; either specified here or by using syntax `name@project` in cluster name",
+        ),
         click.option("-t", "--instance-type", type=str, default="i4i.xlarge", help="Instance type"),
         click.option("-N", "--number", type=int, default=1, help="Number of instances"),
         click.option("-r", "--region", type=str, default="us-east-1", help="Region"),
@@ -1110,6 +247,7 @@ def common_cli_options(f: T) -> T:
 )
 def create_instances(
     name: str,
+    project: str | None,
     instance_type: str,
     number: int,
     region: str,
@@ -1148,7 +286,12 @@ def create_instances(
 
     assert owner is not None, "Cannot determine owner from environment; please specify --owner"
 
-    tags = {"Project": name, "Contact": owner}
+    tags = {
+        "Project": name,
+        "Contact": owner,
+        **({"Tool": __package__} if __package__ else {}),
+        **({"ai2-project": project} if project else {}),
+    }
     logger.info(f"Using tags: {tags}")
 
     logger.info(f"Importing SSH key to EC2 in region {region}...")
@@ -1183,7 +326,6 @@ def create_instances(
 
     for i in range(start_id, total_to_create):
         logger.info(f"Creating instance {i + 1 - start_id} of {number} (index: {i})...")
-
         instance = InstanceInfo.create_instance(
             instance_type=instance_type,
             tags=tags | {"Name": f"{name}-{i:04d}"},  # Add Name tag with index
@@ -1197,6 +339,7 @@ def create_instances(
             storage_iops=storage_iops,
             zone=zone,
         )
+
         logger.info(f"Created instance {instance.instance_id} with name {instance.name}")
         instances.append(instance)
 
@@ -1384,6 +527,13 @@ def resume_instances(
 
 
 @common_cli_options
+@click.option(
+    "-j",
+    "--parallelism",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Maximum number of instances to run in parallel (default: all selected instances)",
+)
 def run_command(
     name: str,
     region: str,
@@ -1394,6 +544,7 @@ def run_command(
     detach: bool,
     spindown: bool,
     instance_username: str,
+    parallelism: int | None = None,
     timeout: int | None = None,
     **kwargs,
 ):
@@ -1410,6 +561,7 @@ def run_command(
         detach: Whether to run command in detached mode (via screen)
         spindown: Whether to self-terminate the instance after the command completes
         instance_username: SSH username for connecting to instances
+        parallelism: Maximum number of instances to run in parallel
         timeout: Optional timeout in seconds for command execution
         **kwargs: Additional keyword arguments
     """
@@ -1429,11 +581,27 @@ def run_command(
         instances = [instance for instance in instances if instance.instance_id in instance_id]
         logger.info(f"After filtering, command will run on {len(instances)} instances")
 
-    for instance in instances:
+    if len(instances) == 0:
+        logger.warning("No instances found to run command on")
+        return
+
+    non_running_instances = [instance for instance in instances if instance.state != InstanceStatus.RUNNING]
+    if len(non_running_instances) > 0:
+        for instance in non_running_instances:
+            logger.error(f"Instance {instance.instance_id} is not running (state: {instance.state})")
+        non_running_ids = ", ".join(instance.instance_id for instance in non_running_instances)
+        raise ValueError(f"Instances are not running: {non_running_ids}")
+
+    base_command_to_run = script_to_command(script, to_file=True) if script is not None else command
+    assert base_command_to_run is not None, "command and script cannot both be None"
+
+    max_workers = len(instances) if parallelism is None else min(parallelism, len(instances))
+    logger.info(f"Running command on {len(instances)} instances with max parallelism={max_workers}")
+
+    def run_on_instance(instance: "InstanceInfo") -> tuple[str, str]:
         logger.info(f"Running command on instance {instance.instance_id} ({instance.name})")
 
-        command_to_run = script_to_command(script, to_file=True) if script is not None else command
-        assert command_to_run is not None, "command and script cannot both be None"
+        command_to_run = base_command_to_run
 
         if spindown:
             command_to_run = f"{command_to_run}; aws ec2 terminate-instances --instance-ids {instance.instance_id}"
@@ -1444,15 +612,33 @@ def run_command(
             private_key_path=ssh_key_path,
             user=instance_username,
         )
-
-        if instance.state != InstanceStatus.RUNNING:
-            logger.error(f"Instance {instance.instance_id} is not running (state: {instance.state})")
-            raise ValueError(f"Instance {instance.instance_id} is not running")
-
         output_ = session.run(command_to_run, detach=detach, timeout=timeout)
+        return instance.instance_id, str(output_)
+
+    outputs: dict[str, str] = {}
+    errors: dict[str, Exception] = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(run_on_instance, instance): instance for instance in instances}
+        for future in as_completed(futures):
+            instance = futures[future]
+            try:
+                instance_id_, output_ = future.result()
+                outputs[instance_id_] = output_
+            except Exception as e:
+                errors[instance.instance_id] = e
+                logger.error(f"Command failed on instance {instance.instance_id} ({instance.name}): {e}")
+
+    for instance in instances:
         print(f"Instance {instance.instance_id}:")
-        print(output_)
+        if instance.instance_id in outputs:
+            print(outputs[instance.instance_id])
+        else:
+            print(f"ERROR: {errors[instance.instance_id]}")
         print()
+
+    if len(errors) > 0:
+        failed_instance_ids = ", ".join(sorted(errors))
+        raise click.ClickException(f"Command execution failed on {len(errors)} instance(s): {failed_instance_ids}")
 
     logger.info(f"Command execution completed on {len(instances)} instances")
 

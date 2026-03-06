@@ -1,0 +1,522 @@
+import dataclasses as dt
+import datetime
+import os
+from enum import Enum
+from typing import TYPE_CHECKING, Optional, Union
+
+import boto3
+
+from . import logger
+
+if TYPE_CHECKING:
+    from mypy_boto3_ec2.client import EC2Client
+    from mypy_boto3_ec2.type_defs import InstanceStatusTypeDef, InstanceTypeDef
+    from mypy_boto3_ssm.client import SSMClient
+
+
+class InstanceStatus(Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    SHUTTING_DOWN = "shutting-down"
+    TERMINATED = "terminated"
+    STOPPING = "stopping"
+    STOPPED = "stopped"
+
+    @classmethod
+    def active(cls) -> list["InstanceStatus"]:
+        return [
+            status
+            for status in cls
+            if status != cls.TERMINATED and status != cls.STOPPED and status != cls.SHUTTING_DOWN
+        ]
+
+    @classmethod
+    def unterminated(cls) -> list["InstanceStatus"]:
+        return [status for status in cls if status != cls.TERMINATED and status != cls.SHUTTING_DOWN]
+
+
+class ClientUtils:
+    @staticmethod
+    def get_ec2_client(
+        region: str = "us-east-1",
+        profile_name: str | None = None,
+    ) -> Union["EC2Client", None]:
+        """
+        Get a boto3 client for the specified service and region.
+        """
+        session = boto3.Session(profile_name=os.getenv("AWS_PROFILE", profile_name))
+        return session.client("ec2", region_name=region)  # type: ignore
+
+    @staticmethod
+    def get_ssm_client(
+        region: str = "us-east-1",
+        profile_name: str | None = None,
+    ) -> Union["SSMClient", None]:
+        """
+        Get a boto3 SSM client for the specified region.
+        """
+        session = boto3.Session(profile_name=os.getenv("AWS_PROFILE", profile_name))
+        return session.client("ssm", region_name=region)  # type: ignore
+
+
+@dt.dataclass(frozen=True)
+class InstanceInfo:
+    """
+    Represents information about an EC2 instance.
+
+    This class encapsulates all relevant details about an EC2 instance and provides
+    methods for instance management operations like creation, description, and termination.
+
+    Attributes:
+        instance_id: The unique identifier for the EC2 instance
+        instance_type: The type of the instance (e.g., t2.micro, m5.large)
+        image_id: The AMI ID used to launch the instance
+        state: Current state of the instance (e.g., running, stopped)
+        public_ip_address: The public IP address assigned to the instance
+        public_dns_name: The public DNS name assigned to the instance
+        name: The Name tag value of the instance
+        tags: Dictionary of all tags applied to the instance
+        zone: The availability zone where the instance is running
+        region: The AWS region where the instance is located
+    """
+
+    instance_id: str
+    instance_type: str
+    image_id: str
+    state: InstanceStatus
+    public_ip_address: str
+    public_dns_name: str
+    name: str
+    tags: dict[str, str]
+    zone: str
+    created_at: datetime.datetime
+    region: str = "us-east-1"
+    _status: list[tuple[str, str]] = dt.field(init=False, default_factory=list)
+
+    def _update_status(self, name: str, status: str):
+        self._status.append((name, status))
+
+    @property
+    def checks(self) -> str:
+        all_status = len(self._status)
+        all_ok = sum(1 for _, status in self._status if status == "ok")
+        return f"{all_ok}/{all_status}"
+
+    @property
+    def pretty_checks(self) -> str:
+        if len(self._status) == 0:
+            # bracket text in yellow
+            start, end = "\033[93m", "\033[0m"
+        elif sum(1 for _, status in self._status if status == "ok") == len(self._status):
+            # bracket text in green
+            start, end = "\033[92m", "\033[0m"
+        else:
+            # bracket text in red
+            start, end = "\033[91m", "\033[0m"
+
+        return f"{start}{self.checks}{end}"
+
+    @property
+    def pretty_state(self) -> str:
+        if self.state == InstanceStatus.RUNNING:
+            # bracket text in green
+            start, end = "\033[92m", "\033[0m"
+        elif self.state == InstanceStatus.PENDING:
+            # bracket text in blue
+            start, end = "\033[94m", "\033[0m"
+        elif self.state == InstanceStatus.SHUTTING_DOWN:
+            # bracket text in red
+            start, end = "\033[91m", "\033[0m"
+        else:
+            # bracket text in yellow
+            start, end = "\033[93m", "\033[0m"
+
+        return f"{start}{self.state.value}{end}"
+
+    @property
+    def pretty_id(self) -> str:
+        return f"\033[1m{self.instance_id}\033[0m"
+
+    @property
+    def pretty_ip(self) -> str:
+        # make the ip address italic
+        return f"\033[3m{self.public_ip_address or '·'}\033[0m"
+
+    @classmethod
+    def from_instance(
+        cls,
+        description: Union[dict, "InstanceTypeDef"],
+        status: Optional[Union[dict, "InstanceStatusTypeDef"]] = None,
+    ) -> "InstanceInfo":
+        """
+        Creates an InstanceInfo object from an EC2 instance dictionary.
+
+        Args:
+            instance: Dictionary containing EC2 instance details or boto3 InstanceTypeDef
+
+        Returns:
+            An InstanceInfo object populated with the instance details
+        """
+        name = str(next((tag.get("Value") for tag in description.get("Tags", []) if tag.get("Key") == "Name"), ""))
+
+        instance = cls(
+            instance_id=description.get("InstanceId", ""),
+            instance_type=description.get("InstanceType", ""),
+            image_id=description.get("ImageId", ""),
+            state=InstanceStatus(description.get("State", {}).get("Name", "")),
+            public_ip_address=description.get("PublicIpAddress", ""),
+            public_dns_name=description.get("PublicDnsName", ""),
+            name=name,
+            created_at=description.get("LaunchTime", datetime.datetime.min),
+            tags={tag["Key"]: tag.get("Value", "") for tag in description.get("Tags", []) if "Key" in tag},
+            zone=description.get("Placement", {}).get("AvailabilityZone", ""),
+        )
+
+        for instance_status, instance_value in (status or {}).items():
+            if instance_status.endswith("Status"):
+                assert isinstance(instance_value, dict), f"{instance_value} is {type(instance_value)}, not dict"
+                instance._update_status(name=instance_status, status=instance_value.get("Status", ""))
+        return instance
+
+    @classmethod
+    def describe_instances(
+        cls,
+        instance_ids: list[str] | None = None,
+        client: Union["EC2Client", "SSMClient", None] = None,
+        region: str | None = None,
+        project: str | None = None,
+        owner: str | None = None,
+        contact: str | None = None,
+        statuses: list["InstanceStatus"] | None = None,
+    ) -> list["InstanceInfo"]:
+        """
+        Retrieves information about multiple EC2 instances based on filters.
+
+        Args:
+            instance_ids: Optional list of instance IDs to filter by
+            client: Optional boto3 EC2 client to use
+            region: AWS region to query (defaults to class region)
+            project: Optional project tag to filter by
+            owner: Deprecated; use contact instead
+            contact: Optional contact tag to filter by
+            statuses: Optional list of instance statuses to include
+
+        Returns:
+            List of InstanceInfo objects matching the specified criteria
+        """
+
+        statuses = statuses or InstanceStatus.active()
+
+        client = client or ClientUtils.get_ec2_client(region=region or cls.region)
+        assert client, "EC2 client is required"
+
+        filters = []
+        filters.append({"Name": "instance-state-name", "Values": [status.value for status in statuses]})
+
+        if instance_ids:
+            filters.append({"Name": "instance-id", "Values": instance_ids})
+
+        if owner:
+            logger.error("The owner tag is deprecated. Use the contact tag instead.")
+
+        if contact:
+            filters.append({"Name": "tag:Contact", "Values": [contact]})
+
+        if project:
+            filters.append({"Name": "tag:Project", "Values": [project]})
+
+        response_describe = client.describe_instances(  # pyright: ignore
+            **({"Filters": filters} if filters else {})
+        )
+
+        response_status = client.describe_instance_status(  # pyright: ignore
+            InstanceIds=[
+                id_
+                for reservation in response_describe.get("Reservations", [])
+                for instance in reservation.get("Instances", [])
+                if isinstance(id_ := instance.get("InstanceId"), str)
+            ]
+        )
+
+        instance_statuses = {
+            id_: status
+            for status in response_status.get("InstanceStatuses", [])
+            if isinstance((id_ := status.get("InstanceId")), str)
+        }
+
+        instances = [
+            InstanceInfo.from_instance(description=instance, status=instance_statuses.get(id_, None))
+            for reservation in response_describe.get("Reservations", [])
+            for instance in reservation.get("Instances", [])
+            if isinstance((id_ := instance.get("InstanceId")), str)
+        ]
+
+        return sorted(instances, key=lambda x: x.name)
+
+    @classmethod
+    def describe_instance(
+        cls,
+        instance_id: str,
+        client: Union["EC2Client", "SSMClient", None] = None,
+        region: str | None = None,
+    ) -> "InstanceInfo":
+        """
+        Retrieves detailed information about a specific EC2 instance.
+
+        Args:
+            instance_id: The ID of the instance to describe
+            client: Optional boto3 EC2 client to use
+            region: AWS region where the instance is located
+
+        Returns:
+            InstanceInfo object containing the instance details
+        """
+        client = client or ClientUtils.get_ec2_client(region=region or cls.region)
+        assert client, "EC2 client is required"
+
+        response = client.describe_instances(InstanceIds=[instance_id])  # pyright: ignore
+        return InstanceInfo.from_instance(response.get("Reservations", [])[0].get("Instances", [])[0])
+
+    def pause(self, client: Union["EC2Client", None] = None, wait_for_completion: bool = True) -> bool:
+        """
+        Pauses this EC2 instance.
+
+        Args:
+            client: Optional boto3 EC2 client to use
+            wait_for_completion: If True, wait until the instance is fully paused
+
+        Returns:
+            True if pause was successful, False otherwise
+        """
+        client = client or ClientUtils.get_ec2_client(region=self.region)
+        assert client, "EC2 client is required"
+
+        if self.state == InstanceStatus.STOPPED:
+            logger.info(f"Instance {self.instance_id} ({self.name}) is already paused")
+            return True
+
+        try:
+            logger.info(f"Pausing instance {self.instance_id} ({self.name})...")
+            client.stop_instances(InstanceIds=[self.instance_id])
+
+            if wait_for_completion:
+                logger.info("Waiting for instance to be fully paused...")
+                waiter = client.get_waiter("instance_stopped")
+                waiter.wait(InstanceIds=[self.instance_id])
+                logger.info(f"Instance {self.instance_id} has been paused")
+
+            return True
+
+        except client.exceptions.ClientError as e:
+            logger.error(f"Error pausing instance {self.instance_id}: {str(e)}")
+            return False
+
+    def resume(self, client: Union["EC2Client", None] = None, wait_for_completion: bool = True) -> bool:
+        """
+        Resumes this EC2 instance.
+
+        Args:
+            client: Optional boto3 EC2 client to use
+            wait_for_completion: If True, wait until the instance is fully resumed
+
+        Returns:
+            True if resume was successful, False otherwise
+        """
+        client = client or ClientUtils.get_ec2_client(region=self.region)
+        assert client, "EC2 client is required"
+
+        if self.state == InstanceStatus.RUNNING:
+            logger.info(f"Instance {self.instance_id} ({self.name}) is already running")
+            return True
+
+        try:
+            logger.info(f"Resuming instance {self.instance_id} ({self.name})...")
+            client.start_instances(InstanceIds=[self.instance_id])
+
+            if wait_for_completion:
+                logger.info("Waiting for instance to be fully resumed...")
+                waiter = client.get_waiter("instance_running")
+                waiter.wait(InstanceIds=[self.instance_id])
+                logger.info(f"Instance {self.instance_id} has been resumed")
+
+            return True
+
+        except client.exceptions.ClientError as e:
+            logger.error(f"Error resuming instance {self.instance_id}: {str(e)}")
+            return False
+
+    def terminate(self, client: Union["EC2Client", None] = None, wait_for_termination: bool = True) -> bool:
+        """
+        Terminates this EC2 instance.
+
+        Args:
+            client: Optional boto3 EC2 client to use
+            wait_for_termination: If True, wait until the instance is fully terminated
+
+        Returns:
+            True if termination was successful, False otherwise
+        """
+        client = client or ClientUtils.get_ec2_client(region=self.region)
+        assert client, "EC2 client is required"
+
+        try:
+            logger.info(f"Terminating instance {self.instance_id} ({self.name})...")
+            client.terminate_instances(InstanceIds=[self.instance_id])
+
+            if wait_for_termination:
+                logger.info("Waiting for instance to be fully terminated...")
+                waiter = client.get_waiter("instance_terminated")
+                waiter.wait(InstanceIds=[self.instance_id])
+                logger.info(f"Instance {self.instance_id} has been terminated")
+
+            return True
+
+        except client.exceptions.ClientError as e:
+            error_code = e.response.get("Error", {}).get("Code", "Unknown")
+            if error_code == "InvalidInstanceID.NotFound":
+                logger.info(f"Instance {self.instance_id} not found in region {self.region}")
+            else:
+                logger.error(f"Error terminating instance {self.instance_id}: {str(e)}")
+            return False
+
+    @classmethod
+    def get_latest_ami_id(
+        cls, instance_type: str, client: Union["SSMClient", None] = None, region: str | None = None
+    ) -> str:
+        """
+        Get the latest AMI ID for a given instance type and region
+        """
+        is_arm = instance_type.startswith(("a1", "c6g", "c7g", "m6g", "m7g", "r6g", "r7g", "t4g", "im4gn", "g5g"))
+
+        # Select appropriate AMI based on architecture
+        if is_arm:
+            image_id = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64"
+        else:
+            image_id = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"
+
+        client = client or ClientUtils.get_ssm_client(region=region or cls.region)
+        assert client, "SSM client is required"
+
+        parameter = client.get_parameter(Name=image_id, WithDecryption=False)
+        ami_id = parameter.get("Parameter", {}).get("Value")
+        assert ami_id, f"No AMI ID found for {image_id}"
+        return ami_id
+
+    @classmethod
+    def create_instance(
+        cls,
+        instance_type: str,
+        tags: dict[str, str],
+        region: str,
+        zone: str | None = None,
+        ami_id: str | None = None,
+        wait_for_completion: bool = True,
+        key_name: str | None = None,
+        storage_type: str | None = None,
+        storage_size: int | None = None,
+        storage_iops: int | None = None,
+        client: Union["EC2Client", None] = None,
+    ) -> "InstanceInfo":
+        """
+        Creates a new EC2 instance and waits until it's running.
+
+        Args:
+            instance_type: The EC2 instance type (e.g., 't2.micro')
+            tags: Dictionary of tags to apply to the instance
+            region: AWS region where to launch the instance
+            zone: AWS availability zone where to launch the instance
+            ami_id: AMI ID to use (defaults to Amazon Linux 2 in the specified region)
+            wait_for_completion: Whether to wait for the instance to be running
+            key_name: Name of the key pair to use for SSH access to the instance
+            storage_type: Type of EBS storage (e.g., 'gp2', 'gp3'). If None, uses AWS default
+            storage_size: Size of root volume in GB. If None, uses AWS default
+            storage_iops: IOPS for the root volume. If None, uses AWS default
+            client: Optional boto3 EC2 client to use
+
+        Returns:
+            InstanceInfo object representing the newly created EC2 instance
+        """
+        client = client or ClientUtils.get_ec2_client(region=region)
+        assert client, "EC2 client is required"
+
+        vpcs = client.describe_vpcs()["Vpcs"]
+        vpc_id = vpcs[0].get("VpcId")
+
+        if vpc_id is None:
+            raise ValueError("No VPC ID found in VPC: {}".format(vpcs[0]))
+
+        print(f"Using VPC ID: {vpc_id}")
+
+        ami_id = ami_id or cls.get_latest_ami_id(instance_type=instance_type, region=region)
+
+        tag_specifications = [
+            {"ResourceType": "instance", "Tags": [{"Key": key, "Value": value} for key, value in tags.items()]}
+        ]
+
+        launch_params = {
+            "ImageId": ami_id,
+            "InstanceType": instance_type,
+            "MinCount": 1,
+            "MaxCount": 1,
+            "TagSpecifications": tag_specifications,
+        }
+
+        if zone:
+            launch_params["Placement"] = {"AvailabilityZone": zone}
+
+        if key_name:
+            launch_params["KeyName"] = key_name
+
+        if storage_size is not None:
+            launch_params.update(
+                {
+                    "BlockDeviceMappings": [
+                        {
+                            "DeviceName": "/dev/xvda",
+                            "Ebs": {
+                                "DeleteOnTermination": True,
+                                "VolumeSize": storage_size,
+                                **({"VolumeType": storage_type} if storage_type else {}),
+                                **({"Iops": storage_iops} if storage_iops else {}),
+                            },
+                        }
+                    ]
+                }
+            )
+
+        try:
+            response = client.run_instances(**launch_params)
+        except client.exceptions.ClientError as e:
+            logger.error(f"Failed to create instance: {e}")
+            if e.response.get("Error", {}).get("Code") == "UnauthorizedOperation":
+                logger.error(
+                    "This might be a shadow error due missing tags. Try using cluster name in the "
+                    "format 'cluster-name@project-name'. If you are unsure of what project name "
+                    "to use, ask your team. If you work at Ai2, you may consult this sheet: "
+                    "https://docs.google.com/spreadsheets/d/1RphTD4MQDidyMAIv5J6D3wyJndj0oGcAc3hXk3CPC4w"
+                )
+            if e.response.get("Error", {}).get("Code") == "InsufficientInstanceCapacity":
+                logger.error(
+                    "Insufficient instance capacity. "
+                    "Try using a different instance type; region, or availability zone."
+                )
+            exit(1)
+
+        if (instance_def := next(iter(response["Instances"]), None)) is None:
+            raise Exception("No instance created")
+        else:
+            instance = InstanceInfo.from_instance(instance_def)
+
+        logger.info(f"Created instance {instance.instance_id}")
+
+        if wait_for_completion:
+            logger.info("Waiting for instance to enter 'running' state...")
+            waiter = client.get_waiter("instance_running")
+            waiter.wait(InstanceIds=[instance.instance_id])
+
+            logger.info("Instance is running. Waiting for status checks to pass...")
+            waiter = client.get_waiter("instance_status_ok")
+            waiter.wait(InstanceIds=[instance.instance_id])
+            logger.info(f"Instance {instance.instance_id} is now available and ready to use")
+
+        return instance
