@@ -24,13 +24,13 @@ from typing import Callable, TypeVar
 import click
 
 from . import logger
+from .aws_instance import ClientUtils, InstanceInfo, InstanceStatus
 from .commands import (
     D2TK_SETUP,
     DOLMA_PYTHON_SETUP,
     PACKAGE_MANAGER_DETECTOR,
     make_decon_python_setup,
 )
-from .ec2_instance import ClientUtils, InstanceInfo, InstanceStatus
 from .ssh_session import Session, import_ssh_key_to_ec2
 from .utils import (
     get_aws_access_key_id,
@@ -47,13 +47,13 @@ def cli():
 
 
 T = TypeVar("T", bound=Callable)
-I = TypeVar("I")
+S = TypeVar("S")
 R = TypeVar("R")
 
 
 def run_in_parallel(
-    items: list[I],
-    worker: Callable[[I], R],
+    items: list[S],
+    worker: Callable[[S], R],
     *,
     parallelism: int | None = None,
     action_name: str = "tasks",

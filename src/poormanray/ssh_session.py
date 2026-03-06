@@ -186,7 +186,7 @@ class Session:
         terminate: bool = True,
         timeout: int | None = None,
     ) -> SessionContent:
-        from .ec2_instance import InstanceStatus
+        from .aws_instance import InstanceStatus
 
         if self.instance.state != InstanceStatus.RUNNING:
             raise ValueError(f"Instance {self.instance.instance_id} is not running")
@@ -209,7 +209,7 @@ def import_ssh_key_to_ec2(key_name: str, region: str, private_key_path: str) -> 
     Returns:
         The key pair ID if the import was successful.
     """
-    from .ec2_instance import ClientUtils
+    from .aws_instance import ClientUtils
 
     client = ClientUtils.get_ec2_client(region=region)
     assert client, "EC2 client is required"
