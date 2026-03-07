@@ -4,7 +4,7 @@ This file provides context for code agents (Claude Code, OpenAI Codex, etc.) whe
 
 ## Project Overview
 
-"poormanray" (or "Poor Man Ray", or "pmr") is a CLI tool for managing EC2 instances and distributing jobs across them. It's a minimal alternative to Ray for distributed data processing, primarily designed for the Dolma toolkit ecosystem.
+"poormanray" (or "Poor Man Ray", or "pmr") is a CLI tool for managing cloud instances (EC2 and GCE) and distributing jobs across them. It's a minimal alternative to Ray for distributed data processing, supporting both AWS and GCP. Primarily designed for the Dolma toolkit ecosystem.
 
 ## Project Structure
 
@@ -12,9 +12,17 @@ This file provides context for code agents (Claude Code, OpenAI Codex, etc.) whe
 poormanray/
 ├── pyproject.toml              # Package configuration, dependencies, entry points
 ├── src/poormanray/
-│   ├── __init__.py             # Package version
+│   ├── __init__.py             # Package init, logging setup
+│   ├── version.py              # Package version
 │   ├── cli.py                  # Main CLI with all commands (click-based)
-│   └── utils.py                # AWS credential utilities
+│   ├── aws_instance.py         # AWS backend: InstanceInfo, InstanceStatus, BucketInfo, ClientUtils
+│   ├── gcp_instance.py         # GCP backend: same exports as aws_instance, compatible interfaces
+│   ├── ssh_session.py          # SSH session manager (paramiko), cloud-aware
+│   ├── commands.py             # Shell script constants for instance setup (D2TK, Dolma, DECON, etc.)
+│   ├── utils.py                # AWS credential utilities, script_to_command helper
+│   └── logger.py               # Logging configuration
+├── release-notes/              # Per-version release notes (e.g., 1.0.0.md)
+└── assets/                     # Logo and images
 ```
 
 ## Build & Run Commands
@@ -24,58 +32,83 @@ poormanray/
 uv run poormanray --help
 uv run pmr --help              # Alias
 
-# Install for development
-uv sync
+# Install for development (includes GCP deps)
+uv sync --extra gcp
 
-# Run specific command
+# Run specific command (AWS, default)
 uv run pmr create --name mytest --number 2 --instance-type t3.micro
 uv run pmr list --name mytest
 uv run pmr terminate --name mytest
+
+# Run with GCP
+uv run pmr list --cloud gcp --gcp-project my-project --name mytest
 ```
 
 ## Key Dependencies
 
-- `boto3` - AWS SDK for EC2/SSM operations
+- `boto3` - AWS SDK for EC2/SSM/S3 operations
 - `click` - CLI framework
 - `paramiko` - SSH client for remote command execution
+- `google-cloud-compute` (optional) - GCP Compute Engine SDK
+- `google-cloud-storage` (optional) - GCP Cloud Storage SDK
+- `google-auth` (optional) - GCP authentication
 
 ## Architecture Notes
+
+### Cloud Backend Pattern
+
+The CLI supports AWS and GCP via a backend module pattern:
+
+- `aws_instance.py` and `gcp_instance.py` export the same names: `InstanceInfo`, `InstanceStatus`, `BucketInfo`, `ClientUtils`
+- `resolve_backend(cloud)` in `cli.py` returns the appropriate module
+- Each command calls `backend = resolve_backend(cloud)` then uses `backend.InstanceInfo`, etc.
+- Cloud-specific branching is minimized to only where unavoidable (SSH key import, spindown commands, credential setup)
 
 ### CLI Structure (cli.py)
 
 - Uses `@click.group()` for the main CLI entry point
-- `common_cli_options` decorator applies shared options to all commands
-- Commands: create, list, terminate, run, setup, setup-d2tk, setup-dolma-python, setup-decon, map, pause, resume
+- `base_cli_options` decorator: name, project, region, owner, cloud (shared by all commands)
+- `common_cli_options` decorator: adds instance-specific flags (instance-type, ssh-key, detach, etc.) plus gcp-project
+- Helper functions: `resolve_backend()`, `resolve_region()`, `resolve_instance_username()`, `make_tags()`
+- Commands: create, list, terminate, run, setup, setup-d2tk, setup-dolma-python, setup-decon, map, pause, resume, wait, ssh, create_bucket, update_bucket, delete_bucket, update_cluster, version
 
-### Key Classes
+### Key Classes (per backend)
 
-- `InstanceInfo` - Dataclass representing EC2 instance with methods for create/describe/terminate/pause/resume
-- `Session` - SSH session manager using paramiko, supports running commands in screen sessions
-- `ClientUtils` - Factory for boto3 EC2/SSM clients
+- `InstanceInfo` - Frozen dataclass representing a cloud instance with methods for create/describe/terminate/pause/resume
+- `InstanceStatus` - Enum (PENDING, RUNNING, SHUTTING_DOWN, TERMINATED, STOPPING, STOPPED) with `active()` and `unterminated()` classmethods
+- `BucketInfo` - Static methods for bucket CRUD with lifecycle rules and tag management
+- `ClientUtils` - Factory for cloud SDK clients
+- `Session` (ssh_session.py) - SSH session manager using paramiko, accepts `cloud` and `gcp_project` params
 
-### AWS Integration
+### Tag/Label Conventions
 
-- Instances are tagged with `Project` (cluster name) and `Contact` (owner)
-- SSH keys are imported to EC2 automatically from local `~/.ssh/` keys
-- Credentials are read from AWS CLI config, environment variables, or `~/.aws/credentials`
+- AWS tags: `Project`, `Contact`, `Tool`, `ai2-project`, `Name` (title-case keys)
+- GCP labels: `project`, `contact`, `tool`, `ai2-project` (lowercase, `[a-z0-9_-]` only, max 63 chars)
+- `make_tags()` in cli.py handles the normalization per cloud
+- GCP instance `name` field replaces the AWS `Name` tag
 
 ### Remote Execution
 
 - Commands can run in detached mode using GNU screen
 - Scripts are base64-encoded for transfer to instances
 - The `map` command distributes scripts across instances evenly
+- Spindown commands are cloud-specific: `aws ec2 terminate-instances` vs `gcloud compute instances delete`
 
 ## Common Patterns
 
 - All commands accept `-n/--name` for cluster name (required)
-- `-r/--region` defaults to `us-east-1`
+- `--cloud aws|gcp` selects the cloud provider (default: `aws`, env: `PMR_CLOUD`)
+- `--gcp-project` is required for GCP commands (env: `GCP_PROJECT`)
+- `-r/--region` defaults to `us-east-1` (AWS) or `us-central1` (GCP)
+- `-u/--instance-username` defaults to `ec2-user` (AWS) or the `--owner` value (GCP)
+- `-a/--image` accepts AMI IDs (AWS) or image families (GCP)
 - `-k/--ssh-key-path` auto-detects from `~/.ssh/`
 - `-d/--detach` runs commands in background via screen
 - `-i/--instance-id` can be repeated to target specific instances
 
 ## Testing
 
-No test suite currently exists. Manual testing against AWS is required.
+No test suite currently exists. Manual testing against AWS/GCP is required.
 
 ## Release Notes
 
@@ -116,7 +149,7 @@ When making commits, you need to follow these guidelines:
 
 ### Update release notes
 
-You should update the release notes file in `release_notes/` matching the current version of this software. You can find current version at `src/poormanray/version.py`; the matching release notes file will be named `<version>.md`. If it doesn't exist, create it.
+You should update the release notes file in `release-notes/` matching the current version of this software. You can find current version at `src/poormanray/version.py`; the matching release notes file will be named `<version>.md`. If it doesn't exist, create it.
 
 ### Sign-off
 All commits made by AI agents (Claude, Codex, etc.) **must** include a sign-off line with the model name and version:
