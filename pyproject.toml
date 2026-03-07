@@ -1,7 +1,7 @@
 [project]
 name = "poormanray"
 dynamic = ["version"]
-description = "A minimal alternative to Ray for distributed data processing on EC2 instances"
+description = "A minimal alternative to Ray for distributed data processing on EC2 and GCE instances"
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.11"
@@ -18,7 +18,7 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Topic :: System :: Distributed Computing",
 ]
-keywords = ["aws", "ec2", "distributed", "cluster", "ray", "data-processing"]
+keywords = ["aws", "ec2", "gcp", "gce", "distributed", "cluster", "ray", "data-processing"]
 dependencies = [
     "boto3>=1.26.0",
     "click>=8.0.0",
@@ -26,7 +26,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+gcp = [
+    "google-cloud-compute>=1.15.0",
+    "google-cloud-storage>=2.14.0",
+    "google-auth>=2.23.0",
+]
 dev = [
+    "poormanray[gcp]",
     "boto3-stubs[ec2,ssm]",
     "mypy",
     "ruff",
