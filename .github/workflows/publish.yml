@@ -67,6 +67,6 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           NEW_VERSION=$(python -c "exec(open('src/poormanray/version.py').read()); print(__version__)")
-          git add src/poormanray/version.py
+          git add .
           git commit -m "Bump version to $NEW_VERSION after release"
           git push
