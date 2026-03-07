@@ -29,6 +29,11 @@ pip install poormanray
 # Create a cluster of 5 instances
 pmr create --name mycluster --number 5 --instance-type i4i.2xlarge
 
+# If you need an Ai2 project tag, use either --project...
+pmr create --name mycluster --project my-ai2-project --number 5
+# ...or name@project syntax:
+pmr create --name mycluster@my-ai2-project --number 5
+
 # List instances in the cluster
 pmr list --name mycluster
 
@@ -47,6 +52,27 @@ pmr terminate --name mycluster
   - Credentials file (`~/.aws/credentials`)
 - SSH key pair in `~/.ssh/` (id_rsa, id_ed25519, etc.)
 
+## Project Selection (`--project` or `name@project`)
+
+When creating instances, you can optionally set an Ai2 project tag in two equivalent ways:
+
+```bash
+# Explicit flag
+pmr create --name mycluster --project my-ai2-project
+
+# Inline syntax in --name (split on the first @)
+pmr create --name mycluster@my-ai2-project
+```
+
+Rules enforced by the CLI:
+
+- `--name` is required and must be non-empty.
+- Do not combine `--project` with `--name` that already contains `@`; this raises a usage error.
+- If neither `--project` nor `@project` is provided, pmr logs a warning because some environments require project tagging to launch instances.
+
+For Ai2 users, valid project names are listed here:
+- https://docs.google.com/spreadsheets/d/1RphTD4MQDidyMAIv5J6D3wyJndj0oGcAc3hXk3CPC4w
+
 ## Commands
 
 ### Cluster Management
@@ -56,13 +82,21 @@ pmr terminate --name mycluster
 ```bash
 pmr create --name mycluster --number 5 --instance-type i4i.2xlarge
 
+# With explicit project flag
+pmr create --name mycluster --project my-ai2-project --number 5
+
+# Equivalent inline project syntax
+pmr create --name mycluster@my-ai2-project --number 5
+
 # Options:
 #   -n, --name          Cluster name (required)
+#   -p, --project       Ai2 project name (or specify as name@project)
 #   -N, --number        Number of instances (default: 1)
 #   -t, --instance-type EC2 instance type (default: i4i.xlarge)
 #   -r, --region        AWS region (default: us-east-1)
-#   -a, --ami-id        Custom AMI ID (default: Amazon Linux 2023)
+#   -a, --ami-id        Custom AMI ID (default: latest Amazon Linux 2023 AMI from SSM)
 #   -d, --detach        Don't wait for instances to be ready
+#   -j, --parallelism   Max concurrent instance creations
 #   --zone              Availability zone
 #   --storage-type      EBS volume type (gp3, gp2, io1, io2, io2e, st1, sc1)
 #   --storage-size      Root volume size in GB
@@ -84,6 +118,9 @@ pmr terminate --name mycluster
 
 # Terminate specific instances only:
 pmr terminate --name mycluster -i i-abc123 -i i-def456
+
+# Cap concurrent termination requests
+pmr terminate --name mycluster --parallelism 4
 ```
 
 #### `pause` / `resume` - Stop and start instances
@@ -91,6 +128,10 @@ pmr terminate --name mycluster -i i-abc123 -i i-def456
 ```bash
 pmr pause --name mycluster    # Stop instances (preserves EBS)
 pmr resume --name mycluster   # Start stopped instances
+
+# Control stop/start concurrency
+pmr pause --name mycluster --parallelism 8
+pmr resume --name mycluster --parallelism 8
 ```
 
 #### `wait` - Wait for instances to be ready
@@ -154,11 +195,16 @@ pmr run --name mycluster --command "df -h" --timeout 60
 
 # Run as a different user
 pmr run --name mycluster --command "whoami" --instance-username ubuntu
+
+# Cap concurrent command execution
+pmr run --name mycluster --command "df -h" --parallelism 4
 ```
+
+`run` requires exactly one of `--command` or `--script`.
 
 #### `map` - Distribute scripts across instances
 
-Distributes scripts evenly across all instances and runs them in parallel. Accepts a directory of executable scripts or individual script files via `--script`.
+Distributes scripts evenly across all instances and runs them in parallel. `map` expects `--script` to point to a directory containing executable files.
 
 ```bash
 # Create scripts directory with executable scripts
@@ -219,11 +265,13 @@ All commands decorated with `common_cli_options` accept these flags. Not every f
 
 | Option | Short | Description |
 |--------|-------|-------------|
-| `--name` | `-n` | Cluster name (required) |
+| `--name` | `-n` | Cluster name (required). You can encode project as `name@project`. |
+| `--project` | `-p` | Ai2 project name (equivalent to using `name@project`) |
 | `--region` | `-r` | AWS region (default: us-east-1) |
 | `--instance-id` | `-i` | Target specific instance(s), repeatable |
 | `--ssh-key-path` | `-k` | Path to SSH private key (auto-detected from `~/.ssh/`) |
 | `--detach/--no-detach` | `-d/-nd` | Run in background via screen |
+| `--parallelism` | `-j` | Max concurrent workers for `create`, `terminate`, `pause`, `resume`, and `run` |
 | `--owner` | `-o` | Owner tag for cost tracking (defaults to `$USER`) |
 | `--instance-type` | `-t` | EC2 instance type (default: i4i.xlarge) |
 | `--number` | `-N` | Number of instances to create (default: 1) |
@@ -236,7 +284,7 @@ All commands decorated with `common_cli_options` accept these flags. Not every f
 
 ## How It Works
 
-1. **Instance Tagging**: Instances are tagged with `Project` (cluster name) and `Contact` (owner) for easy identification and cost tracking.
+1. **Instance Tagging**: Instances are tagged with `Project` (cluster name), `Contact` (owner), and `Tool` (`poormanray`). If project is provided, `ai2-project` is also added.
 
 2. **SSH Key Management**: Your local SSH key is automatically imported to EC2 when creating instances.
 
