@@ -222,6 +222,61 @@ pmr map --name mycluster --script scripts/
 pmr map --name mycluster --script scripts/ --spindown
 ```
 
+### S3 Bucket Management
+
+#### `create_bucket` - Create an S3 bucket
+
+Creates a bucket with private visibility, standard tags, intelligent tiering (after 7 days), and hard-delete lifecycle (after 7 days). Bucket names must follow [AWS naming rules](https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucketnamingrules.html) (lowercase, 3-63 chars, no consecutive periods).
+
+```bash
+pmr create_bucket --name my-data-bucket@my-ai2-project
+
+# Customize lifecycle timing
+pmr create_bucket --name my-data-bucket@my-ai2-project \
+  --tier-after-days 14 --expire-after-days 30
+
+# Options:
+#   -n, --name              Bucket name (required)
+#   -p, --project           Ai2 project name (or specify as name@project)
+#   -r, --region            AWS region (default: us-east-1)
+#   --tier-after-days       Days before INTELLIGENT_TIERING transition (default: 7)
+#   --expire-after-days     Days before hard-delete expiration (default: 7)
+```
+
+#### `update_bucket` - Backfill missing bucket settings
+
+Adds missing default tags and lifecycle rules without overwriting existing values. Visibility settings are never changed.
+
+```bash
+pmr update_bucket --name my-data-bucket@my-ai2-project
+```
+
+#### `delete_bucket` - Delete an S3 bucket
+
+Deletes a bucket. Fails if the bucket is not empty.
+
+```bash
+pmr delete_bucket --name my-data-bucket
+
+# Skip confirmation prompt
+pmr delete_bucket --name my-data-bucket --yes
+```
+
+If the bucket is not empty, `pmr` will suggest running `s5cmd rm s3://<bucket>/*` first.
+
+### Cluster Tag Management
+
+#### `update_cluster` - Backfill missing cluster tags
+
+Adds missing default tags (`Project`, `Contact`, `Tool`, `ai2-project`) to EC2 instances without overwriting existing tag values.
+
+```bash
+pmr update_cluster --name mycluster@my-ai2-project
+
+# Update specific instances only
+pmr update_cluster --name mycluster -i i-abc123 -i i-def456
+```
+
 ### Instance Setup
 
 #### `setup` - Configure AWS credentials
@@ -261,18 +316,23 @@ pmr setup-decon --name mycluster --github-token ghp_xxx --detach
 
 ## Common Options
 
-All commands decorated with `common_cli_options` accept these flags. Not every flag is used by every command, but they are accepted uniformly.
+### Base options (all commands)
 
 | Option | Short | Description |
 |--------|-------|-------------|
-| `--name` | `-n` | Cluster name (required). You can encode project as `name@project`. |
+| `--name` | `-n` | Resource name (required). You can encode project as `name@project`. |
 | `--project` | `-p` | Ai2 project name (equivalent to using `name@project`) |
 | `--region` | `-r` | AWS region (default: us-east-1) |
+| `--owner` | `-o` | Owner tag for cost tracking (defaults to `$USER`) |
+
+### Instance options (cluster/instance commands only)
+
+| Option | Short | Description |
+|--------|-------|-------------|
 | `--instance-id` | `-i` | Target specific instance(s), repeatable |
 | `--ssh-key-path` | `-k` | Path to SSH private key (auto-detected from `~/.ssh/`) |
 | `--detach/--no-detach` | `-d/-nd` | Run in background via screen |
 | `--parallelism` | `-j` | Max concurrent workers for `create`, `terminate`, `pause`, `resume`, and `run` |
-| `--owner` | `-o` | Owner tag for cost tracking (defaults to `$USER`) |
 | `--instance-type` | `-t` | EC2 instance type (default: i4i.xlarge) |
 | `--number` | `-N` | Number of instances to create (default: 1) |
 | `--ami-id` | `-a` | Custom AMI ID |

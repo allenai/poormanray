@@ -92,6 +92,79 @@ def run_in_parallel(
     return results, errors
 
 
+def _parse_project_name(ctx: click.Context, param: click.Parameter, value: str | None) -> str | None:
+    if param.name == "name":
+        if value is None:
+            raise click.UsageError("Name must be provided")
+
+        try:
+            value = str(value).strip()
+        except ValueError:
+            raise click.UsageError("Name must be a string")
+
+        if not value:
+            raise click.UsageError("Name must be a non-empty string")
+
+        if "@" in value:
+            if ctx.params.get("project", None) is not None:
+                raise click.UsageError("Name cannot contain '@' when --project is provided")
+
+            cluster, project = value.split("@", 1)
+            ctx.params.setdefault("project", project)
+            return cluster
+
+        return value
+
+    elif param.name == "project":
+        if value is not None:
+            if ctx.params.get("project", None) is not None:
+                raise click.UsageError("Name cannot contain '@' when --project is provided")
+            try:
+                value = str(value).strip()
+            except ValueError:
+                raise click.UsageError("Project name must be a string")
+
+            if not value:
+                raise click.UsageError("Project name must be a non-empty string")
+
+        elif ctx.params.get("project", None) is None and "@" not in ctx.params.get("name", ""):
+            logger.warning(
+                "--name does not contain '@' and --project is not provided. This might result in errors."
+            )
+        return value
+
+
+def base_cli_options(f: T) -> T:
+    """Options shared by all commands: name, project, region, owner."""
+    click_decorators = [
+        click.option(
+            "-n",
+            "--name",
+            type=str,
+            required=True,
+            help="Name",
+            callback=_parse_project_name,
+        ),
+        click.option(
+            "-p",
+            "--project",
+            type=str,
+            default=None,
+            callback=_parse_project_name,
+            help="Ai2 project name; either specified here or by using syntax `name@project`",
+        ),
+        click.option("-r", "--region", type=str, default="us-east-1", help="Region"),
+        click.option(
+            "-o",
+            "--owner",
+            type=str,
+            default=os.getenv("USER") or os.getenv("USERNAME"),
+            help="Owner. Useful for cost tracking.",
+        ),
+    ]
+    return reduce(lambda f, decorator: decorator(f), click_decorators, f)
+
+
 def common_cli_options(f: T) -> T:
     ssh_home = os.path.join(os.path.expanduser("~"), ".ssh")
     default_key_names = ["id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"]
@@ -128,75 +201,10 @@ def common_cli_options(f: T) -> T:
                 raise click.UsageError("Cannot provide both --command and --script")
             return value
 
-    def parse_project_name(ctx: click.Context, param: click.Parameter, value: str | None) -> str | None:
-        if param.name == "name":
-            if value is None:
-                raise click.UsageError("Cluster name must be provided")
-
-            try:
-                value = str(value).strip()
-            except ValueError:
-                raise click.UsageError("Cluster name must be a string")
-
-            if not value:
-                raise click.UsageError("Cluster name must be a non-empty string")
-
-            if "@" in value:
-                if ctx.params.get("project", None) is not None:
-                    raise click.UsageError("Name cannot contain '@' when --project is provided")
-
-                cluster, project = value.split("@", 1)
-                ctx.params.setdefault("project", project)
-                return cluster
-
-            return value
-
-        elif param.name == "project":
-            if value is not None:
-                if ctx.params.get("project", None) is not None:
-                    raise click.UsageError("Name cannot contain '@' when --project is provided")
-                try:
-                    value = str(value).strip()
-                except ValueError:
-                    raise click.UsageError("Cluster name must be a string")
-
-                if not value:
-                    raise click.UsageError("Cluster name must be a non-empty string")
-
-            elif ctx.params.get("project", None) is None and "@" not in ctx.params.get("name", ""):
-                logger.warning(
-                    "--name does not contain '@' and --project is not provided. This might result in errors."
-                )
-            return value
-
     click_decorators = [
-        click.option(
-            "-n",
-            "--name",
-            type=str,
-            required=True,
-            help="Cluster name",
-            callback=parse_project_name,
-        ),
-        click.option(
-            "-p",
-            "--project",
-            type=str,
-            default=None,
-            callback=parse_project_name,
-            help="Ai2 project name; either specified here or by using syntax `name@project` in cluster name",
-        ),
         click.option("-t", "--instance-type", type=str, default="i4i.xlarge", help="Instance type"),
         click.option("-N", "--number", type=int, default=1, help="Number of instances"),
-        click.option("-r", "--region", type=str, default="us-east-1", help="Region"),
         click.option("-T", "--timeout", type=int, default=None, help="Timeout for the command"),
-        click.option(
-            "-o",
-            "--owner",
-            type=str,
-            default=os.getenv("USER") or os.getenv("USERNAME"),
-            help="Owner of the cluster. Useful for cost tracking.",
-        ),
         click.option(
             "-S/-NS",
             "--spindown/--no-spindown",
@@ -267,7 +275,8 @@ def common_cli_options(f: T) -> T:
         ),
     ]
 
-    return reduce(lambda f, decorator: decorator(f), click_decorators, f)
+    f = reduce(lambda f, decorator: decorator(f), click_decorators, f)
+    return base_cli_options(f)
 
 
 @common_cli_options
@@ -422,7 +431,7 @@ def create_instances(
     return instances
 
 
-@common_cli_options
+@base_cli_options
 @click.option(
     "--tier-after-days",
     type=click.IntRange(min=1),
@@ -482,7 +491,7 @@ def create_bucket(
     logger.info(f"Created bucket '{name}'")
 
 
-@common_cli_options
+@base_cli_options
 @click.option(
     "--tier-after-days",
     type=click.IntRange(min=1),
@@ -547,10 +556,12 @@ def update_bucket(
         logger.info("Lifecycle defaults were already present")
 
 
-@common_cli_options
+@base_cli_options
+@click.option("-y", "--yes", is_flag=True, default=False, help="Skip confirmation prompt.")
 def delete_bucket(
     name: str,
     region: str,
+    yes: bool,
     **kwargs,
 ):
     """
@@ -559,6 +570,9 @@ def delete_bucket(
     This command intentionally does not empty buckets first; AWS will reject
     deletion when objects still exist.
     """
+    if not yes:
+        click.confirm(f"Delete bucket '{name}'?", abort=True)
+
     logger.info(f"Deleting bucket '{name}' in region {region}")
 
     client = ClientUtils.get_s3_client(region=region)
@@ -577,7 +591,16 @@ def delete_bucket(
     logger.info(f"Deleted bucket '{name}'")
 
 
-@common_cli_options
+@base_cli_options
+@click.option(
+    "-i",
+    "--instance-id",
+    multiple=True,
+    default=None,
+    type=click.UNPROCESSED,
+    callback=lambda _, __, value: list(value) or None,
+    help="Instance ID to work on; can be used multiple times.",
+)
 def update_cluster(
     name: str,
     project: str | None,

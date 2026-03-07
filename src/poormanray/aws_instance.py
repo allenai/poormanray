@@ -1,6 +1,7 @@
 import dataclasses as dt
 import datetime
 import os
+import re
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Optional, Union
 
@@ -74,6 +75,19 @@ class ClientUtils:
 class BucketInfo:
     DEFAULT_TRANSITION_DAYS = 7
     DEFAULT_EXPIRATION_DAYS = 7
+
+    @staticmethod
+    def validate_bucket_name(name: str) -> None:
+        """Validate S3 bucket name according to AWS naming rules."""
+        if len(name) < 3 or len(name) > 63:
+            raise ValueError(f"Bucket name must be 3-63 characters, got {len(name)}")
+        if not re.match(r"^[a-z0-9][a-z0-9.-]*[a-z0-9]$", name):
+            raise ValueError(
+                f"Invalid bucket name '{name}': must contain only lowercase letters, "
+                "digits, hyphens, and periods, and start/end with a letter or digit"
+            )
+        if ".." in name:
+            raise ValueError(f"Bucket name '{name}' cannot contain consecutive periods")
 
     @staticmethod
     def _serialize_tags(tags: dict[str, str]) -> list[dict[str, str]]:
@@ -211,6 +225,8 @@ class BucketInfo:
         expiration_days: int = DEFAULT_EXPIRATION_DAYS,
         client: Any = None,
     ) -> None:
+        cls.validate_bucket_name(bucket_name)
+
         client = client or ClientUtils.get_s3_client(region=region)
         assert client, "S3 client is required"
 
