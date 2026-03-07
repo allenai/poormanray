@@ -8,7 +8,7 @@
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
-A minimal alternative to Ray for distributed data processing on EC2 instances. Manage clusters, run commands, and distribute jobs without the complexity of a full Ray deployment.
+A minimal alternative to Ray for distributed data processing on EC2 and GCE instances. Manage clusters, run commands, and distribute jobs across AWS or GCP without the complexity of a full Ray deployment.
 
 ## Installation
 
@@ -21,18 +21,19 @@ uv tool install poormanray
 # Or install as a library
 uv pip install poormanray
 pip install poormanray
+
+# For GCP support, install with the gcp extra
+uv pip install "poormanray[gcp]"
+pip install "poormanray[gcp]"
 ```
 
 ## Quick Start
 
+### AWS (default)
+
 ```bash
 # Create a cluster of 5 instances
 pmr create --name mycluster --number 5 --instance-type i4i.2xlarge
-
-# If you need an Ai2 project tag, use either --project...
-pmr create --name mycluster --project my-ai2-project --number 5
-# ...or name@project syntax:
-pmr create --name mycluster@my-ai2-project --number 5
 
 # List instances in the cluster
 pmr list --name mycluster
@@ -44,23 +45,33 @@ pmr run --name mycluster --command "echo 'Hello from $(hostname)'"
 pmr terminate --name mycluster
 ```
 
-## Prerequisites
+### GCP
 
-- AWS credentials configured via:
-  - Environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`)
-  - AWS CLI (`aws configure`)
-  - Credentials file (`~/.aws/credentials`)
-- SSH key pair in `~/.ssh/` (id_rsa, id_ed25519, etc.)
+```bash
+# Create a cluster of 5 instances on GCP
+pmr create --cloud gcp --gcp-project my-gcp-project \
+  --name mycluster --number 5 --instance-type n2-standard-4
 
-## Project Selection (`--project` or `name@project`)
+# List instances
+pmr list --cloud gcp --gcp-project my-gcp-project --name mycluster
 
-When creating instances, you can optionally set an Ai2 project tag in two equivalent ways:
+# Run a command
+pmr run --cloud gcp --gcp-project my-gcp-project \
+  --name mycluster --command "echo 'Hello from $(hostname)'"
+
+# Terminate
+pmr terminate --cloud gcp --gcp-project my-gcp-project --name mycluster
+```
+
+**Tip**: Set `PMR_CLOUD=gcp` and `GCP_PROJECT=my-gcp-project` as environment variables to avoid repeating `--cloud gcp --gcp-project ...` on every command.
+
+### Project tagging (`--project` or `name@project`)
 
 ```bash
 # Explicit flag
 pmr create --name mycluster --project my-ai2-project
 
-# Inline syntax in --name (split on the first @)
+# Inline syntax (split on the first @)
 pmr create --name mycluster@my-ai2-project
 ```
 
@@ -73,34 +84,54 @@ Rules enforced by the CLI:
 For Ai2 users, valid project names are listed here:
 - https://docs.google.com/spreadsheets/d/1RphTD4MQDidyMAIv5J6D3wyJndj0oGcAc3hXk3CPC4w
 
+## Prerequisites
+
+### AWS
+
+- AWS credentials configured via:
+  - Environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`)
+  - AWS CLI (`aws configure`)
+  - Credentials file (`~/.aws/credentials`)
+- SSH key pair in `~/.ssh/` (id_rsa, id_ed25519, etc.)
+
+### GCP
+
+- GCP authentication configured via:
+  - Application Default Credentials (`gcloud auth application-default login`)
+  - Service account key (`GOOGLE_APPLICATION_CREDENTIALS` env var)
+- A GCP project ID (via `--gcp-project`, `GCP_PROJECT` env var, or `gcloud config set project`)
+- SSH key pair in `~/.ssh/` (the public key is injected into instance metadata)
+
+GCE instances use a default compute service account, so no credential push is needed during `setup` — the service account provides access to GCS and other GCP services.
+
 ## Commands
 
 ### Cluster Management
 
-#### `create` - Launch EC2 instances
+#### `create` - Launch instances
 
 ```bash
 pmr create --name mycluster --number 5 --instance-type i4i.2xlarge
 
-# With explicit project flag
-pmr create --name mycluster --project my-ai2-project --number 5
-
-# Equivalent inline project syntax
-pmr create --name mycluster@my-ai2-project --number 5
+# GCP example
+pmr create --cloud gcp --gcp-project my-project \
+  --name mycluster --number 5 --instance-type n2-standard-4
 
 # Options:
 #   -n, --name          Cluster name (required)
 #   -p, --project       Ai2 project name (or specify as name@project)
 #   -N, --number        Number of instances (default: 1)
-#   -t, --instance-type EC2 instance type (default: i4i.xlarge)
-#   -r, --region        AWS region (default: us-east-1)
-#   -a, --ami-id        Custom AMI ID (default: latest Amazon Linux 2023 AMI from SSM)
+#   -t, --instance-type Instance type (default: i4i.xlarge)
+#   -r, --region        Region (default: us-east-1 for AWS, us-central1 for GCP)
+#   -a, --image         Image ID: AMI for AWS, image family for GCP
 #   -d, --detach        Don't wait for instances to be ready
 #   -j, --parallelism   Max concurrent instance creations
 #   --zone              Availability zone
-#   --storage-type      EBS volume type (gp3, gp2, io1, io2, io2e, st1, sc1)
+#   --storage-type      Volume type (e.g. gp3 for AWS, pd-balanced for GCP)
 #   --storage-size      Root volume size in GB
-#   --storage-iops      IOPS for the root volume
+#   --storage-iops      IOPS for the root volume (AWS only)
+#   --cloud             Cloud provider: aws or gcp (default: aws, env: PMR_CLOUD)
+#   --gcp-project       GCP project ID (env: GCP_PROJECT)
 ```
 
 #### `list` - Show cluster instances
@@ -126,7 +157,7 @@ pmr terminate --name mycluster --parallelism 4
 #### `pause` / `resume` - Stop and start instances
 
 ```bash
-pmr pause --name mycluster    # Stop instances (preserves EBS)
+pmr pause --name mycluster    # Stop instances (preserves disks)
 pmr resume --name mycluster   # Start stopped instances
 
 # Control stop/start concurrency
@@ -222,14 +253,18 @@ pmr map --name mycluster --script scripts/
 pmr map --name mycluster --script scripts/ --spindown
 ```
 
-### S3 Bucket Management
+### Bucket Management
 
-#### `create_bucket` - Create an S3 bucket
+#### `create_bucket` - Create a storage bucket
 
-Creates a bucket with private visibility, standard tags, intelligent tiering (after 7 days), and hard-delete lifecycle (after 7 days). Bucket names must follow [AWS naming rules](https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucketnamingrules.html) (lowercase, 3-63 chars, no consecutive periods).
+Creates a bucket with private visibility, standard tags/labels, tiering (after 7 days), and hard-delete lifecycle (after 7 days).
 
 ```bash
 pmr create_bucket --name my-data-bucket@my-ai2-project
+
+# GCP example
+pmr create_bucket --cloud gcp --gcp-project my-project \
+  --name my-data-bucket@my-ai2-project
 
 # Customize lifecycle timing
 pmr create_bucket --name my-data-bucket@my-ai2-project \
@@ -238,20 +273,22 @@ pmr create_bucket --name my-data-bucket@my-ai2-project \
 # Options:
 #   -n, --name              Bucket name (required)
 #   -p, --project           Ai2 project name (or specify as name@project)
-#   -r, --region            AWS region (default: us-east-1)
-#   --tier-after-days       Days before INTELLIGENT_TIERING transition (default: 7)
+#   -r, --region            Region (default: us-east-1 for AWS, us-central1 for GCP)
+#   --tier-after-days       Days before tiering transition (default: 7)
 #   --expire-after-days     Days before hard-delete expiration (default: 7)
+#   --cloud                 Cloud provider: aws or gcp
+#   --gcp-project           GCP project ID
 ```
 
 #### `update_bucket` - Backfill missing bucket settings
 
-Adds missing default tags and lifecycle rules without overwriting existing values. Visibility settings are never changed.
+Adds missing default tags/labels and lifecycle rules without overwriting existing values. Visibility settings are never changed.
 
 ```bash
 pmr update_bucket --name my-data-bucket@my-ai2-project
 ```
 
-#### `delete_bucket` - Delete an S3 bucket
+#### `delete_bucket` - Delete a storage bucket
 
 Deletes a bucket. Fails if the bucket is not empty.
 
@@ -262,13 +299,13 @@ pmr delete_bucket --name my-data-bucket
 pmr delete_bucket --name my-data-bucket --yes
 ```
 
-If the bucket is not empty, `pmr` will suggest running `s5cmd rm s3://<bucket>/*` first.
+If the bucket is not empty, `pmr` will suggest running `s5cmd rm s3://<bucket>/*` (or `gs://` for GCP) first.
 
 ### Cluster Tag Management
 
-#### `update_cluster` - Backfill missing cluster tags
+#### `update_cluster` - Backfill missing cluster tags/labels
 
-Adds missing default tags (`Project`, `Contact`, `Tool`, `ai2-project`) to EC2 instances without overwriting existing tag values.
+Adds missing default tags (AWS: `Project`, `Contact`, `Tool`, `ai2-project`; GCP: lowercase equivalents) to instances without overwriting existing values.
 
 ```bash
 pmr update_cluster --name mycluster@my-ai2-project
@@ -279,9 +316,10 @@ pmr update_cluster --name mycluster -i i-abc123 -i i-def456
 
 ### Instance Setup
 
-#### `setup` - Configure AWS credentials
+#### `setup` - Configure credentials and screen
 
-Copies your AWS credentials to all instances in the cluster. Also installs GNU screen.
+For AWS: copies your AWS credentials to all instances and installs GNU screen.
+For GCP: installs GNU screen only (service account provides cloud access).
 
 ```bash
 pmr setup --name mycluster
@@ -322,8 +360,9 @@ pmr setup-decon --name mycluster --github-token ghp_xxx --detach
 |--------|-------|-------------|
 | `--name` | `-n` | Resource name (required). You can encode project as `name@project`. |
 | `--project` | `-p` | Ai2 project name (equivalent to using `name@project`) |
-| `--region` | `-r` | AWS region (default: us-east-1) |
+| `--region` | `-r` | Region (default: `us-east-1` for AWS, `us-central1` for GCP) |
 | `--owner` | `-o` | Owner tag for cost tracking (defaults to `$USER`) |
+| `--cloud` | | Cloud provider: `aws` or `gcp` (default: `aws`, env: `PMR_CLOUD`) |
 
 ### Instance options (cluster/instance commands only)
 
@@ -333,28 +372,33 @@ pmr setup-decon --name mycluster --github-token ghp_xxx --detach
 | `--ssh-key-path` | `-k` | Path to SSH private key (auto-detected from `~/.ssh/`) |
 | `--detach/--no-detach` | `-d/-nd` | Run in background via screen |
 | `--parallelism` | `-j` | Max concurrent workers for `create`, `terminate`, `pause`, `resume`, and `run` |
-| `--instance-type` | `-t` | EC2 instance type (default: i4i.xlarge) |
+| `--instance-type` | `-t` | Instance type (default: i4i.xlarge) |
 | `--number` | `-N` | Number of instances to create (default: 1) |
-| `--ami-id` | `-a` | Custom AMI ID |
+| `--image` | `-a` | Image ID: AMI for AWS, image family for GCP |
 | `--timeout` | `-T` | Timeout in seconds for command execution |
 | `--spindown/--no-spindown` | `-S/-NS` | Self-terminate instance after command completes |
 | `--command` | `-c` | Command to execute on instances |
 | `--script` | `-s` | Path to script file or directory to execute |
-| `--instance-username` | `-u` | SSH username (default: ec2-user) |
+| `--instance-username` | `-u` | SSH username (default: `ec2-user` for AWS, `$USER` for GCP) |
+| `--gcp-project` | | GCP project ID (env: `GCP_PROJECT`) |
 
 ## How It Works
 
-1. **Instance Tagging**: Instances are tagged with `Project` (cluster name), `Contact` (owner), and `Tool` (`poormanray`). If project is provided, `ai2-project` is also added.
+1. **Cloud Backend**: The `--cloud` flag selects the backend module (AWS or GCP). Both expose the same interface (`InstanceInfo`, `BucketInfo`, etc.) so all commands work identically across clouds.
 
-2. **SSH Key Management**: Your local SSH key is automatically imported to EC2 when creating instances.
+2. **Instance Tagging**: Instances are tagged with `Project` (cluster name), `Contact` (owner), and `Tool` (`poormanray`). On GCP, labels are lowercase-sanitized to meet GCE requirements.
 
-3. **Remote Execution**: Commands are executed over SSH using paramiko. Long-running commands use GNU screen for detached execution.
+3. **SSH Key Management**: On AWS, your local SSH key is imported to EC2 as a key pair. On GCP, the public key is injected into instance metadata.
 
-4. **Script Distribution**: The `map` command base64-encodes scripts, transfers them to instances, and executes them in parallel.
+4. **Remote Execution**: Commands are executed over SSH using paramiko. Long-running commands use GNU screen for detached execution.
+
+5. **Script Distribution**: The `map` command base64-encodes scripts, transfers them to instances, and executes them in parallel.
+
+6. **Credential Setup**: On AWS, `setup` pushes `~/.aws/credentials` to instances. On GCP, the default compute service account provides access — no credential push needed.
 
 ## Examples
 
-### Data Processing Pipeline
+### Data Processing Pipeline (AWS)
 
 ```bash
 # 1. Create a cluster
@@ -369,12 +413,31 @@ pmr setup-dolma-python --name dataproc --detach
 # 4. Distribute processing scripts
 pmr map --name dataproc --script ./processing-jobs/
 
-# 5. Monitor progress (SSH into an instance to check)
+# 5. Monitor progress
 pmr ssh --name dataproc
-# or check logs across all instances:
-pmr run --name dataproc --command "tail -f ~/*/run_all.log"
 
 # 6. Clean up
+pmr terminate --name dataproc
+```
+
+### Data Processing Pipeline (GCP)
+
+```bash
+export PMR_CLOUD=gcp GCP_PROJECT=my-gcp-project
+
+# 1. Create a cluster
+pmr create --name dataproc --number 10 --instance-type n2-standard-8
+
+# 2. Wait for all instances to be ready
+pmr wait --name dataproc
+
+# 3. Set up the environment (installs screen; no credential push needed)
+pmr setup --name dataproc
+
+# 4. Run processing
+pmr run --name dataproc --script ./process.sh --detach
+
+# 5. Clean up
 pmr terminate --name dataproc
 ```
 
