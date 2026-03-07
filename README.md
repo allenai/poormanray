@@ -5,14 +5,14 @@
 </p>
 
 [![PyPI version](https://badge.fury.io/py/poormanray.svg)](https://badge.fury.io/py/poormanray)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
 A minimal alternative to Ray for distributed data processing on EC2 instances. Manage clusters, run commands, and distribute jobs without the complexity of a full Ray deployment.
 
 ## Installation
 
-Requires Python 3.12+.
+Requires Python 3.11+.
 
 ```bash
 # Install as a CLI tool (recommended)
