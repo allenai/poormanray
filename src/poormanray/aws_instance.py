@@ -2,9 +2,10 @@ import dataclasses as dt
 import datetime
 import os
 from enum import Enum
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Any, Optional, Union
 
 import boto3
+from botocore.exceptions import ClientError
 
 from . import logger
 
@@ -57,6 +58,243 @@ class ClientUtils:
         """
         session = boto3.Session(profile_name=os.getenv("AWS_PROFILE", profile_name))
         return session.client("ssm", region_name=region)  # type: ignore
+
+    @staticmethod
+    def get_s3_client(
+        region: str = "us-east-1",
+        profile_name: str | None = None,
+    ) -> Any:
+        """
+        Get a boto3 S3 client for the specified region.
+        """
+        session = boto3.Session(profile_name=os.getenv("AWS_PROFILE", profile_name))
+        return session.client("s3", region_name=region)
+
+
+class BucketInfo:
+    DEFAULT_TRANSITION_DAYS = 7
+    DEFAULT_EXPIRATION_DAYS = 7
+
+    @staticmethod
+    def _serialize_tags(tags: dict[str, str]) -> list[dict[str, str]]:
+        return [{"Key": key, "Value": value} for key, value in tags.items()]
+
+    @classmethod
+    def default_tags(
+        cls,
+        name: str,
+        owner: str,
+        project: str | None = None,
+        tool: str | None = None,
+    ) -> dict[str, str]:
+        tags = {
+            "Name": name,
+            "Project": name,
+            "Contact": owner,
+        }
+        if tool:
+            tags["Tool"] = tool
+        if project:
+            tags["ai2-project"] = project
+        return tags
+
+    @classmethod
+    def _default_transition_rule(cls, transition_days: int) -> dict[str, Any]:
+        return {
+            "ID": f"pmr-intelligent-tiering-{transition_days}d",
+            "Status": "Enabled",
+            "Filter": {"Prefix": ""},
+            "Transitions": [
+                {
+                    "Days": transition_days,
+                    "StorageClass": "INTELLIGENT_TIERING",
+                }
+            ],
+        }
+
+    @classmethod
+    def _default_expiration_rule(cls, expiration_days: int) -> dict[str, Any]:
+        return {
+            "ID": f"pmr-hard-delete-{expiration_days}d",
+            "Status": "Enabled",
+            "Filter": {"Prefix": ""},
+            "Expiration": {"Days": expiration_days},
+            "NoncurrentVersionExpiration": {"NoncurrentDays": expiration_days},
+            "AbortIncompleteMultipartUpload": {"DaysAfterInitiation": expiration_days},
+        }
+
+    @classmethod
+    def default_lifecycle_rules(cls, transition_days: int, expiration_days: int) -> list[dict[str, Any]]:
+        return [
+            cls._default_transition_rule(transition_days=transition_days),
+            cls._default_expiration_rule(expiration_days=expiration_days),
+        ]
+
+    @staticmethod
+    def _error_code(error: ClientError) -> str:
+        return str(error.response.get("Error", {}).get("Code", ""))
+
+    @classmethod
+    def apply_default_lifecycle(
+        cls,
+        bucket_name: str,
+        *,
+        transition_days: int = DEFAULT_TRANSITION_DAYS,
+        expiration_days: int = DEFAULT_EXPIRATION_DAYS,
+        client: Any = None,
+    ) -> None:
+        client = client or ClientUtils.get_s3_client()
+        assert client, "S3 client is required"
+
+        client.put_bucket_lifecycle_configuration(
+            Bucket=bucket_name,
+            LifecycleConfiguration={
+                "Rules": cls.default_lifecycle_rules(
+                    transition_days=transition_days,
+                    expiration_days=expiration_days,
+                )
+            },
+        )
+
+    @classmethod
+    def ensure_default_lifecycle(
+        cls,
+        bucket_name: str,
+        *,
+        transition_days: int = DEFAULT_TRANSITION_DAYS,
+        expiration_days: int = DEFAULT_EXPIRATION_DAYS,
+        client: Any = None,
+    ) -> bool:
+        client = client or ClientUtils.get_s3_client()
+        assert client, "S3 client is required"
+
+        try:
+            response = client.get_bucket_lifecycle_configuration(Bucket=bucket_name)
+            current_rules = response.get("Rules", [])
+        except ClientError as error:
+            if cls._error_code(error) != "NoSuchLifecycleConfiguration":
+                raise
+            current_rules = []
+
+        has_intelligent_tiering = any(
+            transition.get("StorageClass") == "INTELLIGENT_TIERING"
+            for rule in current_rules
+            for transition in rule.get("Transitions", [])
+        )
+        has_hard_delete = any(
+            bool(rule.get("Expiration")) or bool(rule.get("NoncurrentVersionExpiration")) for rule in current_rules
+        )
+
+        rules_to_add = []
+        if not has_intelligent_tiering:
+            rules_to_add.append(cls._default_transition_rule(transition_days=transition_days))
+        if not has_hard_delete:
+            rules_to_add.append(cls._default_expiration_rule(expiration_days=expiration_days))
+
+        if len(rules_to_add) == 0:
+            return False
+
+        client.put_bucket_lifecycle_configuration(
+            Bucket=bucket_name,
+            LifecycleConfiguration={"Rules": [*current_rules, *rules_to_add]},
+        )
+        return True
+
+    @classmethod
+    def create_bucket(
+        cls,
+        bucket_name: str,
+        *,
+        region: str = "us-east-1",
+        tags: dict[str, str] | None = None,
+        transition_days: int = DEFAULT_TRANSITION_DAYS,
+        expiration_days: int = DEFAULT_EXPIRATION_DAYS,
+        client: Any = None,
+    ) -> None:
+        client = client or ClientUtils.get_s3_client(region=region)
+        assert client, "S3 client is required"
+
+        create_params: dict[str, Any] = {"Bucket": bucket_name}
+        if region != "us-east-1":
+            create_params["CreateBucketConfiguration"] = {"LocationConstraint": region}
+
+        client.create_bucket(**create_params)
+        client.get_waiter("bucket_exists").wait(Bucket=bucket_name)
+
+        client.put_public_access_block(
+            Bucket=bucket_name,
+            PublicAccessBlockConfiguration={
+                "BlockPublicAcls": True,
+                "IgnorePublicAcls": True,
+                "BlockPublicPolicy": True,
+                "RestrictPublicBuckets": True,
+            },
+        )
+
+        if tags:
+            client.put_bucket_tagging(Bucket=bucket_name, Tagging={"TagSet": cls._serialize_tags(tags)})
+
+        cls.apply_default_lifecycle(
+            bucket_name=bucket_name,
+            transition_days=transition_days,
+            expiration_days=expiration_days,
+            client=client,
+        )
+
+    @classmethod
+    def update_bucket(
+        cls,
+        bucket_name: str,
+        *,
+        tags: dict[str, str] | None = None,
+        transition_days: int = DEFAULT_TRANSITION_DAYS,
+        expiration_days: int = DEFAULT_EXPIRATION_DAYS,
+        client: Any = None,
+    ) -> tuple[dict[str, str], bool]:
+        client = client or ClientUtils.get_s3_client()
+        assert client, "S3 client is required"
+
+        client.head_bucket(Bucket=bucket_name)
+
+        existing_tags: dict[str, str] = {}
+        try:
+            tag_response = client.get_bucket_tagging(Bucket=bucket_name)
+            existing_tags = {
+                tag.get("Key", ""): tag.get("Value", "")
+                for tag in tag_response.get("TagSet", [])
+                if tag.get("Key")
+            }
+        except ClientError as error:
+            if cls._error_code(error) != "NoSuchTagSet":
+                raise
+
+        requested_tags = tags or {}
+        missing_tags = {key: value for key, value in requested_tags.items() if key not in existing_tags}
+        if len(missing_tags) > 0:
+            client.put_bucket_tagging(
+                Bucket=bucket_name,
+                Tagging={"TagSet": cls._serialize_tags(existing_tags | missing_tags)},
+            )
+
+        lifecycle_updated = cls.ensure_default_lifecycle(
+            bucket_name=bucket_name,
+            transition_days=transition_days,
+            expiration_days=expiration_days,
+            client=client,
+        )
+
+        return missing_tags, lifecycle_updated
+
+    @classmethod
+    def delete_bucket(
+        cls,
+        bucket_name: str,
+        *,
+        client: Any = None,
+    ) -> None:
+        client = client or ClientUtils.get_s3_client()
+        assert client, "S3 client is required"
+        client.delete_bucket(Bucket=bucket_name)
 
 
 @dt.dataclass(frozen=True)
@@ -276,6 +514,57 @@ class InstanceInfo:
 
         response = client.describe_instances(InstanceIds=[instance_id])  # pyright: ignore
         return InstanceInfo.from_instance(response.get("Reservations", [])[0].get("Instances", [])[0])
+
+    @classmethod
+    def update_cluster_tags(
+        cls,
+        project: str,
+        tags: dict[str, str],
+        *,
+        region: str = "us-east-1",
+        instance_ids: list[str] | None = None,
+        statuses: list["InstanceStatus"] | None = None,
+        client: Union["EC2Client", None] = None,
+    ) -> tuple[list["InstanceInfo"], dict[str, dict[str, str]]]:
+        """
+        Add missing tags to instances in a cluster without overwriting existing values.
+
+        Args:
+            project: Cluster/project value used by the `Project` tag filter.
+            tags: Desired tags to backfill.
+            region: AWS region where instances are located.
+            instance_ids: Optional explicit instance IDs to update.
+            statuses: Optional instance-state filter.
+            client: Optional boto3 EC2 client to use.
+
+        Returns:
+            tuple[list[InstanceInfo], dict[str, dict[str, str]]]:
+                The selected instances and the per-instance tags that were added.
+        """
+        client = client or ClientUtils.get_ec2_client(region=region)
+        assert client, "EC2 client is required"
+
+        instances = cls.describe_instances(
+            instance_ids=instance_ids,
+            client=client,
+            region=region,
+            project=project,
+            statuses=statuses or InstanceStatus.unterminated(),
+        )
+
+        added_tags: dict[str, dict[str, str]] = {}
+        for instance in instances:
+            missing_tags = {key: value for key, value in tags.items() if key not in instance.tags}
+            if len(missing_tags) == 0:
+                continue
+
+            client.create_tags(
+                Resources=[instance.instance_id],
+                Tags=[{"Key": key, "Value": value} for key, value in missing_tags.items()],
+            )
+            added_tags[instance.instance_id] = missing_tags
+
+        return instances, added_tags
 
     def pause(self, client: Union["EC2Client", None] = None, wait_for_completion: bool = True) -> bool:
         """

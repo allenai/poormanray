@@ -22,9 +22,10 @@ from functools import partial, reduce
 from typing import Callable, TypeVar
 
 import click
+from botocore.exceptions import ClientError
 
 from . import logger
-from .aws_instance import ClientUtils, InstanceInfo, InstanceStatus
+from .aws_instance import BucketInfo, ClientUtils, InstanceInfo, InstanceStatus
 from .commands import (
     D2TK_SETUP,
     DOLMA_PYTHON_SETUP,
@@ -419,6 +420,216 @@ def create_instances(
 
     logger.info(f"Successfully created {len(instances)} instances")
     return instances
+
+
+@common_cli_options
+@click.option(
+    "--tier-after-days",
+    type=click.IntRange(min=1),
+    default=7,
+    show_default=True,
+    help="Days before transitioning objects to INTELLIGENT_TIERING.",
+)
+@click.option(
+    "--expire-after-days",
+    type=click.IntRange(min=1),
+    default=7,
+    show_default=True,
+    help="Days before hard-delete lifecycle expiration.",
+)
+def create_bucket(
+    name: str,
+    project: str | None,
+    region: str,
+    owner: str,
+    tier_after_days: int,
+    expire_after_days: int,
+    **kwargs,
+):
+    """
+    Create an S3 bucket with poormanray defaults.
+
+    The bucket is created in the requested region with private/public-blocked
+    visibility, cluster-style tags, and default lifecycle rules for intelligent
+    tiering and hard-delete.
+    """
+    assert owner is not None, "Cannot determine owner from environment; please specify --owner"
+
+    tags = BucketInfo.default_tags(
+        name=name,
+        owner=owner,
+        project=project,
+        tool=__package__,
+    )
+    logger.info(f"Creating bucket '{name}' in region {region}")
+    logger.info(f"Using tags: {tags}")
+
+    client = ClientUtils.get_s3_client(region=region)
+    assert client, "S3 client is required"
+
+    try:
+        BucketInfo.create_bucket(
+            bucket_name=name,
+            region=region,
+            tags=tags,
+            transition_days=tier_after_days,
+            expiration_days=expire_after_days,
+            client=client,
+        )
+    except ClientError as e:
+        raise click.ClickException(f"Failed to create bucket '{name}': {e}") from e
+
+    logger.info(f"Created bucket '{name}'")
+
+
+@common_cli_options
+@click.option(
+    "--tier-after-days",
+    type=click.IntRange(min=1),
+    default=7,
+    show_default=True,
+    help="Days used when adding a missing INTELLIGENT_TIERING lifecycle rule.",
+)
+@click.option(
+    "--expire-after-days",
+    type=click.IntRange(min=1),
+    default=7,
+    show_default=True,
+    help="Days used when adding a missing hard-delete lifecycle rule.",
+)
+def update_bucket(
+    name: str,
+    project: str | None,
+    region: str,
+    owner: str,
+    tier_after_days: int,
+    expire_after_days: int,
+    **kwargs,
+):
+    """
+    Backfill missing default S3 bucket settings without changing visibility.
+
+    Adds missing default tags and lifecycle rules if absent. Existing tag values,
+    ACLs, bucket policies, and public access settings are left unchanged.
+    """
+    assert owner is not None, "Cannot determine owner from environment; please specify --owner"
+
+    tags = BucketInfo.default_tags(
+        name=name,
+        owner=owner,
+        project=project,
+        tool=__package__,
+    )
+    logger.info(f"Updating bucket '{name}' in region {region}")
+
+    client = ClientUtils.get_s3_client(region=region)
+    assert client, "S3 client is required"
+
+    try:
+        missing_tags, lifecycle_updated = BucketInfo.update_bucket(
+            bucket_name=name,
+            tags=tags,
+            transition_days=tier_after_days,
+            expiration_days=expire_after_days,
+            client=client,
+        )
+    except ClientError as e:
+        raise click.ClickException(f"Failed to update bucket '{name}': {e}") from e
+
+    if len(missing_tags) == 0:
+        logger.info("No missing bucket tags detected")
+    else:
+        logger.info(f"Added missing bucket tags: {missing_tags}")
+
+    if lifecycle_updated:
+        logger.info("Added missing lifecycle defaults")
+    else:
+        logger.info("Lifecycle defaults were already present")
+
+
+@common_cli_options
+def delete_bucket(
+    name: str,
+    region: str,
+    **kwargs,
+):
+    """
+    Delete an S3 bucket.
+
+    This command intentionally does not empty buckets first; AWS will reject
+    deletion when objects still exist.
+    """
+    logger.info(f"Deleting bucket '{name}' in region {region}")
+
+    client = ClientUtils.get_s3_client(region=region)
+    assert client, "S3 client is required"
+
+    try:
+        BucketInfo.delete_bucket(bucket_name=name, client=client)
+    except ClientError as e:
+        error_code = str(e.response.get("Error", {}).get("Code", ""))
+        if error_code == "BucketNotEmpty":
+            raise click.ClickException(
+                f"Bucket '{name}' is not empty. Remove objects first with: s5cmd rm s3://{name}/*"
+            ) from e
+        raise click.ClickException(f"Failed to delete bucket '{name}': {e}") from e
+
+    logger.info(f"Deleted bucket '{name}'")
+
+
+@common_cli_options
+def update_cluster(
+    name: str,
+    project: str | None,
+    region: str,
+    owner: str,
+    instance_id: list[str] | None,
+    **kwargs,
+):
+    """
+    Backfill missing cluster tags on EC2 instances without overwriting values.
+    """
+    assert owner is not None, "Cannot determine owner from environment; please specify --owner"
+
+    tags = {
+        "Project": name,
+        "Contact": owner,
+        **({"Tool": __package__} if __package__ else {}),
+        **({"ai2-project": project} if project else {}),
+    }
+    logger.info(f"Updating cluster tags for project={name} in region {region}")
+    logger.info(f"Ensuring tags exist: {tags}")
+
+    client = ClientUtils.get_ec2_client(region=region)
+    assert client, "EC2 client is required"
+
+    try:
+        instances, added_tags = InstanceInfo.update_cluster_tags(
+            project=name,
+            tags=tags,
+            region=region,
+            instance_ids=instance_id,
+            statuses=InstanceStatus.unterminated(),
+            client=client,
+        )
+    except ClientError as e:
+        raise click.ClickException(f"Failed to update cluster '{name}': {e}") from e
+
+    if len(instances) == 0:
+        logger.warning("No matching instances found")
+        return
+
+    changed_instances = [instance for instance in instances if instance.instance_id in added_tags]
+    unchanged_instances = [instance for instance in instances if instance.instance_id not in added_tags]
+
+    for instance in changed_instances:
+        logger.info(f"Updated {instance.instance_id} ({instance.name}) with {added_tags[instance.instance_id]}")
+    for instance in unchanged_instances:
+        logger.info(f"No missing tags for {instance.instance_id} ({instance.name})")
+
+    logger.info(
+        f"Tag update complete. Updated {len(changed_instances)} / {len(instances)} instance(s) in cluster '{name}'"
+    )
 
 
 @common_cli_options
@@ -1422,8 +1633,10 @@ def version():
 
 
 cli.command(name="create")(create_instances)
+cli.command(name="create_bucket")(create_bucket)
 cli.command(name="list")(list_instances)
 cli.command(name="terminate")(terminate_instances)
+cli.command(name="update_cluster")(update_cluster)
 cli.command(name="run")(run_command)
 cli.command(name="setup")(setup_instances)
 cli.command(name="setup-d2tk")(setup_dolma2_toolkit)
@@ -1432,6 +1645,8 @@ cli.command(name="setup-decon")(setup_decon)
 cli.command(name="map")(map_commands)
 cli.command(name="pause")(pause_instances)
 cli.command(name="resume")(resume_instances)
+cli.command(name="update_bucket")(update_bucket)
+cli.command(name="delete_bucket")(delete_bucket)
 cli.command(name="wait")(wait_instances)
 cli.command(name="ssh")(ssh_instance)
 
