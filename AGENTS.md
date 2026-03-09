@@ -2,6 +2,8 @@
 
 This file provides context for code agents (Claude Code, OpenAI Codex, etc.) when working on this repository.
 
+**IMPORTANT: Always use `uv` for all Python commands.** This project uses `uv` for dependency management. Never use bare `python`, `pip`, or `pytest` — always prefix with `uv run`. For example: `uv run python -c "..."`, not `python -c "..."`.
+
 ## Project Overview
 
 "poormanray" (or "Poor Man Ray", or "pmr") is a CLI tool for managing cloud instances (EC2 and GCE) and distributing jobs across them. It's a minimal alternative to Ray for distributed data processing, supporting both AWS and GCP. Primarily designed for the Dolma toolkit ecosystem.
@@ -15,8 +17,9 @@ poormanray/
 │   ├── __init__.py             # Package init, logging setup
 │   ├── version.py              # Package version
 │   ├── cli.py                  # Main CLI with all commands (click-based)
-│   ├── aws_instance.py         # AWS backend: InstanceInfo, InstanceStatus, BucketInfo, ClientUtils
-│   ├── gcp_instance.py         # GCP backend: same exports as aws_instance, compatible interfaces
+│   ├── base_instance.py        # Shared base: InstanceStatus, InstanceInfoBase, BucketInfoBase
+│   ├── aws_instance.py         # AWS backend: InstanceInfo, BucketInfo, ClientUtils (extends base)
+│   ├── gcp_instance.py         # GCP backend: same exports as aws_instance (extends base)
 │   ├── ssh_session.py          # SSH session manager (paramiko), cloud-aware
 │   ├── commands.py             # Shell script constants for instance setup (D2TK, Dolma, DECON, etc.)
 │   ├── utils.py                # AWS credential utilities, script_to_command helper
@@ -26,6 +29,8 @@ poormanray/
 ```
 
 ## Build & Run Commands
+
+**IMPORTANT: Always use `uv` for all Python commands.** This project uses `uv` for dependency management. Never use bare `python`, `pip`, or `pytest` — always prefix with `uv run`. For example: `uv run python -c "..."`, not `python -c "..."`.
 
 ```bash
 # Run the CLI
@@ -42,6 +47,9 @@ uv run pmr terminate --name mytest
 
 # Run with GCP
 uv run pmr list --cloud gcp --gcp-project my-project --name mytest
+
+# Run Python scripts or one-liners
+uv run python -c "from poormanray.aws_instance import InstanceInfo; print('ok')"
 ```
 
 ## Key Dependencies
@@ -59,9 +67,11 @@ uv run pmr list --cloud gcp --gcp-project my-project --name mytest
 
 The CLI supports AWS and GCP via a backend module pattern:
 
-- `aws_instance.py` and `gcp_instance.py` export the same names: `InstanceInfo`, `InstanceStatus`, `BucketInfo`, `ClientUtils`
+- `base_instance.py` defines shared base classes: `InstanceStatus` (enum), `InstanceInfoBase` (frozen dataclass with display properties), and `BucketInfoBase` (validation and constants)
+- `aws_instance.py` and `gcp_instance.py` extend these bases and export the same names: `InstanceInfo`, `InstanceStatus`, `BucketInfo`, `ClientUtils`
 - `resolve_backend(cloud)` in `cli.py` returns the appropriate module
 - Each command calls `backend = resolve_backend(cloud)` then uses `backend.InstanceInfo`, etc.
+- `InstanceStatus` is the same class in both backends (imported from `base_instance`)
 - Cloud-specific branching is minimized to only where unavoidable (SSH key import, spindown commands, credential setup)
 
 ### CLI Structure (cli.py)
@@ -72,12 +82,19 @@ The CLI supports AWS and GCP via a backend module pattern:
 - Helper functions: `resolve_backend()`, `resolve_region()`, `resolve_instance_username()`, `make_tags()`
 - Commands: create, list, terminate, run, setup, setup-d2tk, setup-dolma-python, setup-decon, map, pause, resume, wait, ssh, create_bucket, update_bucket, delete_bucket, update_cluster, version
 
-### Key Classes (per backend)
+### Key Classes
 
-- `InstanceInfo` - Frozen dataclass representing a cloud instance with methods for create/describe/terminate/pause/resume
+**Shared base classes** (in `base_instance.py`):
 - `InstanceStatus` - Enum (PENDING, RUNNING, SHUTTING_DOWN, TERMINATED, STOPPING, STOPPED) with `active()` and `unterminated()` classmethods
-- `BucketInfo` - Static methods for bucket CRUD with lifecycle rules and tag management
+- `InstanceInfoBase` - Frozen dataclass with common fields and display properties (`pretty_state`, `pretty_id`, `pretty_ip`, `pretty_tags`, `pretty_checks`)
+- `BucketInfoBase` - Bucket name validation and lifecycle day constants
+
+**Per-backend classes** (in `aws_instance.py` / `gcp_instance.py`, extend the bases above):
+- `InstanceInfo(InstanceInfoBase)` - Cloud-specific methods for create/describe/terminate/pause/resume. AWS defaults `region="us-east-1"`; GCP defaults `region="us-central1"` and adds `gcp_project` field
+- `BucketInfo(BucketInfoBase)` - Cloud-specific bucket CRUD with lifecycle rules and tag management
 - `ClientUtils` - Factory for cloud SDK clients
+
+**Other**:
 - `Session` (ssh_session.py) - SSH session manager using paramiko, accepts `cloud` and `gcp_project` params
 
 ### Tag/Label Conventions
