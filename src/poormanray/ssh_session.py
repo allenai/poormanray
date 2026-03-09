@@ -62,12 +62,28 @@ class Session:
         private_key_path: str | None = None,
         user: str = "ec2-user",
         client: Union["EC2Client", None] = None,
+        cloud: str = "aws",
+        gcp_project: str | None = None,
     ):
-        from .cli import InstanceInfo
+        if cloud == "gcp":
+            from .gcp_instance import InstanceInfo as GCPInstanceInfo
+            from .gcp_instance import InstanceStatus as GCPInstanceStatus
+
+            self.instance = GCPInstanceInfo.describe_instance(
+                instance_id=instance_id, region=region, gcp_project=gcp_project, client=client
+            )
+            self.InstanceStatus = GCPInstanceStatus
+        else:
+            from .aws_instance import InstanceInfo as AWSInstanceInfo
+            from .aws_instance import InstanceStatus as AWSInstanceStatus
+
+            self.instance = AWSInstanceInfo.describe_instance(
+                instance_id=instance_id, region=region, client=client
+            )
+            self.InstanceStatus = AWSInstanceStatus
 
         self.private_key_path = private_key_path
         self.user = user
-        self.instance = InstanceInfo.describe_instance(instance_id=instance_id, region=region, client=client)
 
     def make_ssh_client(self) -> paramiko.SSHClient:
         client = paramiko.SSHClient()
@@ -186,9 +202,7 @@ class Session:
         terminate: bool = True,
         timeout: int | None = None,
     ) -> SessionContent:
-        from .aws_instance import InstanceStatus
-
-        if self.instance.state != InstanceStatus.RUNNING:
+        if self.instance.state != self.InstanceStatus.RUNNING:
             raise ValueError(f"Instance {self.instance.instance_id} is not running")
 
         if detach:

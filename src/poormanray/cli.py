@@ -16,30 +16,22 @@ import os
 import random
 import re
 import time
+import types
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import partial, reduce
 from typing import Callable, TypeVar
 
 import click
-from botocore.exceptions import ClientError
 
 from . import logger
-from .aws_instance import BucketInfo, ClientUtils, InstanceInfo, InstanceStatus
 from .commands import (
     D2TK_SETUP,
     DOLMA_PYTHON_SETUP,
     PACKAGE_MANAGER_DETECTOR,
     make_decon_python_setup,
 )
-from .ssh_session import Session, import_ssh_key_to_ec2
-from .utils import (
-    get_aws_access_key_id,
-    get_aws_secret_access_key,
-    make_aws_config,
-    make_aws_credentials,
-    script_to_command,
-)
+from .utils import script_to_command
 
 
 @click.group()
@@ -50,6 +42,64 @@ def cli():
 T = TypeVar("T", bound=Callable)
 S = TypeVar("S")
 R = TypeVar("R")
+
+
+def resolve_backend(cloud: str) -> types.ModuleType:
+    """Return aws_instance or gcp_instance module."""
+    if cloud == "gcp":
+        try:
+            from . import gcp_instance
+
+            return gcp_instance
+        except ImportError as e:
+            raise click.UsageError(
+                "GCP dependencies are not installed. Install them with: pip install poormanray[gcp]"
+            ) from e
+    else:
+        from . import aws_instance
+
+        return aws_instance
+
+
+def resolve_region(region: str | None, cloud: str) -> str:
+    if region is not None:
+        return region
+    return "us-central1" if cloud == "gcp" else "us-east-1"
+
+
+def resolve_instance_username(username: str | None, cloud: str, owner: str) -> str:
+    if username is not None:
+        return username
+    return owner if cloud == "gcp" else "ec2-user"
+
+
+def resolve_instance_type(instance_type: str | None, cloud: str) -> str:
+    if instance_type is not None:
+        return instance_type
+    return "n2-standard-4" if cloud == "gcp" else "i4i.xlarge"
+
+
+def make_tags(name: str, owner: str, project: str | None, cloud: str) -> dict[str, str]:
+    if cloud == "gcp":
+        from .gcp_instance import _sanitize_label_value
+
+        tags: dict[str, str] = {
+            "project": _sanitize_label_value(name),
+            "contact": _sanitize_label_value(owner),
+        }
+        if __package__:
+            tags["tool"] = _sanitize_label_value(__package__)
+        if project:
+            tags["ai2-project"] = _sanitize_label_value(project)
+        return tags
+    else:
+        tags = {
+            "Project": name,
+            "Contact": owner,
+            **({"Tool": __package__} if __package__ else {}),
+            **({"ai2-project": project} if project else {}),
+        }
+        return tags
 
 
 def run_in_parallel(
@@ -135,7 +185,7 @@ def _parse_project_name(ctx: click.Context, param: click.Parameter, value: str |
 
 
 def base_cli_options(f: T) -> T:
-    """Options shared by all commands: name, project, region, owner."""
+    """Options shared by all commands: name, project, region, owner, cloud."""
     click_decorators = [
         click.option(
             "-n",
@@ -153,13 +203,27 @@ def base_cli_options(f: T) -> T:
             callback=_parse_project_name,
             help="Ai2 project name; either specified here or by using syntax `name@project`",
         ),
-        click.option("-r", "--region", type=str, default="us-east-1", help="Region"),
+        click.option(
+            "-r",
+            "--region",
+            type=str,
+            default=None,
+            help="Region (default: us-east-1 for AWS, us-central1 for GCP)",
+        ),
         click.option(
             "-o",
             "--owner",
             type=str,
             default=os.getenv("USER") or os.getenv("USERNAME"),
             help="Owner. Useful for cost tracking.",
+        ),
+        click.option(
+            "-C",
+            "--cloud",
+            type=click.Choice(["aws", "gcp"]),
+            default="aws",
+            envvar="PMR_CLOUD",
+            help="Cloud provider to use (default: aws, env: PMR_CLOUD)",
         ),
     ]
     return reduce(lambda f, decorator: decorator(f), click_decorators, f)
@@ -202,7 +266,13 @@ def common_cli_options(f: T) -> T:
             return value
 
     click_decorators = [
-        click.option("-t", "--instance-type", type=str, default="i4i.xlarge", help="Instance type"),
+        click.option(
+            "-t",
+            "--instance-type",
+            type=str,
+            default=None,
+            help="Instance type (default: i4i.xlarge for AWS, n2-standard-4 for GCP)",
+        ),
         click.option("-N", "--number", type=int, default=1, help="Number of instances"),
         click.option("-T", "--timeout", type=int, default=None, help="Timeout for the command"),
         click.option(
@@ -230,10 +300,11 @@ def common_cli_options(f: T) -> T:
         ),
         click.option(
             "-a",
-            "--ami-id",
+            "--image",
+            "image_id",
             type=str,
             default=None,
-            help="AMI ID to use for the instances",
+            help="Image ID (AMI for AWS, image family for GCP) to use for the instances",
         ),
         click.option(
             "-j",
@@ -270,8 +341,16 @@ def common_cli_options(f: T) -> T:
             "-u",
             "--instance-username",
             type=str,
-            default="ec2-user",
-            help="Username to use for SSH connections to the instances",
+            default=None,
+            help="Username to use for SSH connections (default: ec2-user for AWS, owner for GCP)",
+        ),
+        click.option(
+            "-G",
+            "--gcp-project",
+            type=str,
+            default=None,
+            envvar="GCP_PROJECT",
+            help="GCP project ID (env: GCP_PROJECT). Required when --cloud=gcp.",
         ),
     ]
 
@@ -281,24 +360,28 @@ def common_cli_options(f: T) -> T:
 
 @common_cli_options
 @click.option(
+    "-E",
     "--storage-type",
-    type=click.Choice(["gp3", "gp2", "io1", "io2", "io2e", "st1", "sc1"]),
+    type=str,
     default=None,
-    help="Storage type to use for the instances",
+    help="Storage type to use for the instances (e.g. gp3 for AWS, pd-balanced for GCP)",
 )
 @click.option(
+    "-Z",
     "--storage-size",
     type=int,
     default=None,
     help="Storage size to use for the instances",
 )
 @click.option(
+    "-I",
     "--storage-iops",
     type=int,
     default=None,
-    help="IOPS for the root volume",
+    help="IOPS for the root volume (AWS only)",
 )
 @click.option(
+    "-z",
     "--zone",
     type=str,
     default=None,
@@ -309,73 +392,80 @@ def create_instances(
     project: str | None,
     instance_type: str,
     number: int,
-    region: str,
+    region: str | None,
     owner: str,
     ssh_key_path: str,
-    ami_id: str | None,
+    image_id: str | None,
     detach: bool,
     storage_type: str | None,
     storage_size: int | None,
     storage_iops: int | None,
     zone: str | None,
     parallelism: int | None,
+    cloud: str,
+    gcp_project: str | None,
     **kwargs,
 ):
     """
-    Create one or more EC2 instances for a cluster.
+    Create one or more instances for a cluster.
 
-    Imports the local SSH key into EC2, tags each instance with cluster metadata,
-    and assigns deterministic `Name` tags (`<name>-0000`, `<name>-0001`, ...). If
-    matching instances already exist, numbering continues from the highest suffix
-    to avoid collisions. When not detached, instance creation waits for completion.
+    Tags each instance with cluster metadata and assigns deterministic names
+    (`<name>-0000`, `<name>-0001`, ...). If matching instances already exist,
+    numbering continues from the highest suffix to avoid collisions.
 
     \f
 
     Args:
-        name: Cluster name used for `Project` and `Name` tags.
-        project: Optional ai2 project name stored in the `ai2-project` tag.
-        instance_type: EC2 instance type to launch (for example, `i4i.xlarge`).
+        name: Cluster name used for tags/labels.
+        project: Optional ai2 project name.
+        instance_type: Instance type to launch.
         number: Number of new instances to create.
-        region: AWS region where instances are created.
-        owner: Contact/owner tag value and SSH key name prefix.
-        ssh_key_path: Path to the local private SSH key file to import.
-        ami_id: Optional AMI ID override; if unset, the default AMI resolution is used.
+        region: Cloud region where instances are created.
+        owner: Contact/owner tag value.
+        ssh_key_path: Path to the local private SSH key file.
+        image_id: Optional image ID override.
         detach: If `True`, return without waiting for instances to finish launching.
-        storage_type: Optional EBS root volume type override.
-        storage_size: Optional EBS root volume size in GiB.
-        storage_iops: Optional EBS root volume IOPS value.
+        storage_type: Optional root volume type override.
+        storage_size: Optional root volume size in GiB.
+        storage_iops: Optional root volume IOPS value (AWS only).
         zone: Optional availability zone override.
         parallelism: Maximum number of instances to create concurrently.
+        cloud: Cloud provider (aws or gcp).
+        gcp_project: GCP project ID.
         **kwargs: Additional CLI options injected by shared decorators; ignored here.
-
-    Returns:
-        list[InstanceInfo]: Created instances in launch order.
     """
-    logger.info(f"Creating {number} instances of type {instance_type} in region {region}")
+    region = resolve_region(region, cloud)
+    instance_type = resolve_instance_type(instance_type, cloud)
+    backend = resolve_backend(cloud)
+
+    logger.info(f"Creating {number} instances of type {instance_type} in region {region} ({cloud})")
 
     assert owner is not None, "Cannot determine owner from environment; please specify --owner"
 
-    tags = {
-        "Project": name,
-        "Contact": owner,
-        **({"Tool": __package__} if __package__ else {}),
-        **({"ai2-project": project} if project else {}),
-    }
+    tags = make_tags(name, owner, project, cloud)
     logger.info(f"Using tags: {tags}")
 
-    logger.info(f"Importing SSH key to EC2 in region {region}...")
-    key_name = import_ssh_key_to_ec2(key_name=f"{owner}-{name}", region=region, private_key_path=ssh_key_path)
-    logger.info(f"Imported SSH key with name: {key_name}")
+    # SSH key import is AWS-only
+    key_name = None
+    if cloud == "aws":
+        from .ssh_session import import_ssh_key_to_ec2
+
+        logger.info(f"Importing SSH key to EC2 in region {region}...")
+        key_name = import_ssh_key_to_ec2(key_name=f"{owner}-{name}", region=region, private_key_path=ssh_key_path)
+        logger.info(f"Imported SSH key with name: {key_name}")
 
     # Determine starting index from existing instances to avoid name collisions
+    InstanceInfo = backend.InstanceInfo
+    InstanceStatus = backend.InstanceStatus
+
     existing_instances = InstanceInfo.describe_instances(
         region=region,
         project=name,
         statuses=InstanceStatus.unterminated(),
+        **({"gcp_project": gcp_project} if cloud == "gcp" else {}),
     )
     if len(existing_instances) > 0:
         logger.info(f"Found {len(existing_instances)} existing instances with the same tags.")
-        # Extract the highest numeric suffix from existing instance names
         start_id = (
             max(
                 int(_match.group(1))
@@ -390,23 +480,42 @@ def create_instances(
         logger.info("No existing instances found. Starting with index 0")
 
     create_indices = list(range(start_id, start_id + number))
+    ClientUtils = backend.ClientUtils
 
-    def create_single(index: int) -> InstanceInfo:
+    def create_single(index: int):
+        instance_name = f"{name}-{index:04d}"
         logger.info(f"Creating instance {index + 1 - start_id} of {number} (index: {index})...")
-        ec2_client = ClientUtils.get_ec2_client(region=region)
-        instance = InstanceInfo.create_instance(
-            instance_type=instance_type,
-            tags=tags | {"Name": f"{name}-{index:04d}"},  # Add Name tag with index
-            key_name=key_name,
-            region=region,
-            ami_id=ami_id,
-            wait_for_completion=not detach,
-            client=ec2_client,
-            storage_type=storage_type,
-            storage_size=storage_size,
-            storage_iops=storage_iops,
-            zone=zone,
-        )
+
+        if cloud == "gcp":
+            instance = InstanceInfo.create_instance(
+                instance_type=instance_type,
+                region=region,
+                zone=zone,
+                instance_name=instance_name,
+                labels=tags,
+                image=image_id,
+                wait_for_completion=not detach,
+                ssh_user=owner,
+                ssh_public_key_path=ssh_key_path,
+                storage_type=storage_type,
+                storage_size=storage_size,
+                gcp_project=gcp_project,
+            )
+        else:
+            ec2_client = ClientUtils.get_ec2_client(region=region)
+            instance = InstanceInfo.create_instance(
+                instance_type=instance_type,
+                tags=tags | {"Name": instance_name},
+                key_name=key_name,
+                region=region,
+                ami_id=image_id,
+                wait_for_completion=not detach,
+                client=ec2_client,
+                storage_type=storage_type,
+                storage_size=storage_size,
+                storage_iops=storage_iops,
+                zone=zone,
+            )
         logger.info(f"Created instance {instance.instance_id} with name {instance.name}")
         return instance
 
@@ -437,7 +546,7 @@ def create_instances(
     type=click.IntRange(min=1),
     default=7,
     show_default=True,
-    help="Days before transitioning objects to INTELLIGENT_TIERING.",
+    help="Days before transitioning objects to INTELLIGENT_TIERING / NEARLINE.",
 )
 @click.option(
     "--expire-after-days",
@@ -446,46 +555,69 @@ def create_instances(
     show_default=True,
     help="Days before hard-delete lifecycle expiration.",
 )
+@click.option(
+    "-G",
+    "--gcp-project",
+    type=str,
+    default=None,
+    envvar="GCP_PROJECT",
+    help="GCP project ID (env: GCP_PROJECT). Required when --cloud=gcp.",
+)
 def create_bucket(
     name: str,
     project: str | None,
-    region: str,
+    region: str | None,
     owner: str,
     tier_after_days: int,
     expire_after_days: int,
+    cloud: str,
+    gcp_project: str | None,
     **kwargs,
 ):
     """
-    Create an S3 bucket with poormanray defaults.
+    Create a storage bucket with poormanray defaults.
 
     The bucket is created in the requested region with private/public-blocked
-    visibility, cluster-style tags, and default lifecycle rules for intelligent
-    tiering and hard-delete.
+    visibility, cluster-style tags/labels, and default lifecycle rules.
     """
+    region = resolve_region(region, cloud)
+    backend = resolve_backend(cloud)
+    BucketInfo = backend.BucketInfo
+
     assert owner is not None, "Cannot determine owner from environment; please specify --owner"
 
-    tags = BucketInfo.default_tags(
+    bucket_tags = BucketInfo.default_tags(
         name=name,
         owner=owner,
         project=project,
         tool=__package__,
     )
-    logger.info(f"Creating bucket '{name}' in region {region}")
-    logger.info(f"Using tags: {tags}")
-
-    client = ClientUtils.get_s3_client(region=region)
-    assert client, "S3 client is required"
+    logger.info(f"Creating bucket '{name}' in region {region} ({cloud})")
+    logger.info(f"Using tags: {bucket_tags}")
 
     try:
-        BucketInfo.create_bucket(
-            bucket_name=name,
-            region=region,
-            tags=tags,
-            transition_days=tier_after_days,
-            expiration_days=expire_after_days,
-            client=client,
-        )
-    except ClientError as e:
+        if cloud == "gcp":
+            BucketInfo.create_bucket(
+                bucket_name=name,
+                location=region,
+                labels=bucket_tags,
+                transition_days=tier_after_days,
+                expiration_days=expire_after_days,
+                gcp_project=gcp_project,
+            )
+        else:
+            ClientUtils = backend.ClientUtils
+            client = ClientUtils.get_s3_client(region=region)
+            assert client, "S3 client is required"
+            BucketInfo.create_bucket(
+                bucket_name=name,
+                region=region,
+                tags=bucket_tags,
+                transition_days=tier_after_days,
+                expiration_days=expire_after_days,
+                client=client,
+            )
+    except Exception as e:
         raise click.ClickException(f"Failed to create bucket '{name}': {e}") from e
 
     logger.info(f"Created bucket '{name}'")
@@ -497,7 +629,7 @@ def create_bucket(
     type=click.IntRange(min=1),
     default=7,
     show_default=True,
-    help="Days used when adding a missing INTELLIGENT_TIERING lifecycle rule.",
+    help="Days used when adding a missing INTELLIGENT_TIERING / NEARLINE lifecycle rule.",
 )
 @click.option(
     "--expire-after-days",
@@ -506,43 +638,65 @@ def create_bucket(
     show_default=True,
     help="Days used when adding a missing hard-delete lifecycle rule.",
 )
+@click.option(
+    "-G",
+    "--gcp-project",
+    type=str,
+    default=None,
+    envvar="GCP_PROJECT",
+    help="GCP project ID (env: GCP_PROJECT). Required when --cloud=gcp.",
+)
 def update_bucket(
     name: str,
     project: str | None,
-    region: str,
+    region: str | None,
     owner: str,
     tier_after_days: int,
     expire_after_days: int,
+    cloud: str,
+    gcp_project: str | None,
     **kwargs,
 ):
     """
-    Backfill missing default S3 bucket settings without changing visibility.
+    Backfill missing default bucket settings without changing visibility.
 
-    Adds missing default tags and lifecycle rules if absent. Existing tag values,
-    ACLs, bucket policies, and public access settings are left unchanged.
+    Adds missing default tags/labels and lifecycle rules if absent.
     """
+    region = resolve_region(region, cloud)
+    backend = resolve_backend(cloud)
+    BucketInfo = backend.BucketInfo
+
     assert owner is not None, "Cannot determine owner from environment; please specify --owner"
 
-    tags = BucketInfo.default_tags(
+    bucket_tags = BucketInfo.default_tags(
         name=name,
         owner=owner,
         project=project,
         tool=__package__,
     )
-    logger.info(f"Updating bucket '{name}' in region {region}")
-
-    client = ClientUtils.get_s3_client(region=region)
-    assert client, "S3 client is required"
+    logger.info(f"Updating bucket '{name}' in region {region} ({cloud})")
 
     try:
-        missing_tags, lifecycle_updated = BucketInfo.update_bucket(
-            bucket_name=name,
-            tags=tags,
-            transition_days=tier_after_days,
-            expiration_days=expire_after_days,
-            client=client,
-        )
-    except ClientError as e:
+        if cloud == "gcp":
+            missing_tags, lifecycle_updated = BucketInfo.update_bucket(
+                bucket_name=name,
+                labels=bucket_tags,
+                transition_days=tier_after_days,
+                expiration_days=expire_after_days,
+                gcp_project=gcp_project,
+            )
+        else:
+            ClientUtils = backend.ClientUtils
+            client = ClientUtils.get_s3_client(region=region)
+            assert client, "S3 client is required"
+            missing_tags, lifecycle_updated = BucketInfo.update_bucket(
+                bucket_name=name,
+                tags=bucket_tags,
+                transition_days=tier_after_days,
+                expiration_days=expire_after_days,
+                client=client,
+            )
+    except Exception as e:
         raise click.ClickException(f"Failed to update bucket '{name}': {e}") from e
 
     if len(missing_tags) == 0:
@@ -558,33 +712,51 @@ def update_bucket(
 
 @base_cli_options
 @click.option("-y", "--yes", is_flag=True, default=False, help="Skip confirmation prompt.")
+@click.option(
+    "-G",
+    "--gcp-project",
+    type=str,
+    default=None,
+    envvar="GCP_PROJECT",
+    help="GCP project ID (env: GCP_PROJECT). Required when --cloud=gcp.",
+)
 def delete_bucket(
     name: str,
-    region: str,
+    region: str | None,
     yes: bool,
+    cloud: str,
+    gcp_project: str | None,
     **kwargs,
 ):
     """
-    Delete an S3 bucket.
+    Delete a storage bucket.
 
-    This command intentionally does not empty buckets first; AWS will reject
-    deletion when objects still exist.
+    This command intentionally does not empty buckets first; the cloud provider
+    will reject deletion when objects still exist.
     """
+    region = resolve_region(region, cloud)
+    backend = resolve_backend(cloud)
+    BucketInfo = backend.BucketInfo
+
     if not yes:
         click.confirm(f"Delete bucket '{name}'?", abort=True)
 
-    logger.info(f"Deleting bucket '{name}' in region {region}")
-
-    client = ClientUtils.get_s3_client(region=region)
-    assert client, "S3 client is required"
+    logger.info(f"Deleting bucket '{name}' in region {region} ({cloud})")
 
     try:
-        BucketInfo.delete_bucket(bucket_name=name, client=client)
-    except ClientError as e:
-        error_code = str(e.response.get("Error", {}).get("Code", ""))
-        if error_code == "BucketNotEmpty":
+        if cloud == "gcp":
+            BucketInfo.delete_bucket(bucket_name=name, gcp_project=gcp_project)
+        else:
+            ClientUtils = backend.ClientUtils
+            client = ClientUtils.get_s3_client(region=region)
+            assert client, "S3 client is required"
+            BucketInfo.delete_bucket(bucket_name=name, client=client)
+    except Exception as e:
+        err_str = str(e)
+        if "BucketNotEmpty" in err_str or "not empty" in err_str.lower():
+            prefix = "gs" if cloud == "gcp" else "s3"
             raise click.ClickException(
-                f"Bucket '{name}' is not empty. Remove objects first with: s5cmd rm s3://{name}/*"
+                f"Bucket '{name}' is not empty. Remove objects first with: s5cmd rm {prefix}://{name}/*"
             ) from e
         raise click.ClickException(f"Failed to delete bucket '{name}': {e}") from e
 
@@ -601,41 +773,61 @@ def delete_bucket(
     callback=lambda _, __, value: list(value) or None,
     help="Instance ID to work on; can be used multiple times.",
 )
+@click.option(
+    "-G",
+    "--gcp-project",
+    type=str,
+    default=None,
+    envvar="GCP_PROJECT",
+    help="GCP project ID (env: GCP_PROJECT). Required when --cloud=gcp.",
+)
 def update_cluster(
     name: str,
     project: str | None,
-    region: str,
+    region: str | None,
     owner: str,
     instance_id: list[str] | None,
+    cloud: str,
+    gcp_project: str | None,
     **kwargs,
 ):
     """
-    Backfill missing cluster tags on EC2 instances without overwriting values.
+    Backfill missing cluster tags/labels on instances without overwriting values.
     """
+    region = resolve_region(region, cloud)
+    backend = resolve_backend(cloud)
+    InstanceInfo = backend.InstanceInfo
+    InstanceStatus = backend.InstanceStatus
+
     assert owner is not None, "Cannot determine owner from environment; please specify --owner"
 
-    tags = {
-        "Project": name,
-        "Contact": owner,
-        **({"Tool": __package__} if __package__ else {}),
-        **({"ai2-project": project} if project else {}),
-    }
-    logger.info(f"Updating cluster tags for project={name} in region {region}")
+    tags = make_tags(name, owner, project, cloud)
+    logger.info(f"Updating cluster tags for project={name} in region {region} ({cloud})")
     logger.info(f"Ensuring tags exist: {tags}")
 
-    client = ClientUtils.get_ec2_client(region=region)
-    assert client, "EC2 client is required"
-
     try:
-        instances, added_tags = InstanceInfo.update_cluster_tags(
-            project=name,
-            tags=tags,
-            region=region,
-            instance_ids=instance_id,
-            statuses=InstanceStatus.unterminated(),
-            client=client,
-        )
-    except ClientError as e:
+        if cloud == "gcp":
+            instances, added_tags = InstanceInfo.update_cluster_tags(
+                project=name,
+                tags=tags,
+                region=region,
+                instance_ids=instance_id,
+                statuses=InstanceStatus.unterminated(),
+                gcp_project=gcp_project,
+            )
+        else:
+            ClientUtils = backend.ClientUtils
+            client = ClientUtils.get_ec2_client(region=region)
+            assert client, "EC2 client is required"
+            instances, added_tags = InstanceInfo.update_cluster_tags(
+                project=name,
+                tags=tags,
+                region=region,
+                instance_ids=instance_id,
+                statuses=InstanceStatus.unterminated(),
+                client=client,
+            )
+    except Exception as e:
         raise click.ClickException(f"Failed to update cluster '{name}': {e}") from e
 
     if len(instances) == 0:
@@ -658,34 +850,40 @@ def update_cluster(
 @common_cli_options
 def list_instances(
     name: str,
-    region: str,
+    region: str | None,
     instance_id: list[str] | None,
+    cloud: str,
+    gcp_project: str | None,
     **kwargs,
 ):
     """
-    List EC2 instances in a cluster.
+    List instances in a cluster.
 
-    Queries EC2 for all unterminated instances tagged with the cluster name,
-    optionally filters to explicit instance IDs, and prints a readable summary of
-    each instance (identity, state, networking, health checks, and tags).
+    Queries the cloud provider for all unterminated instances tagged with the
+    cluster name and prints a readable summary of each instance.
 
     \f
 
     Args:
-        name: Cluster name used to select instances via the `Project` tag.
-        region: AWS region to query.
+        name: Cluster name used to select instances via the `Project` tag/label.
+        region: Cloud region to query.
         instance_id: Optional instance IDs to include in output.
+        cloud: Cloud provider (aws or gcp).
+        gcp_project: GCP project ID.
         **kwargs: Additional CLI options injected by shared decorators; ignored here.
     """
-    logger.info(f"Listing instances with project={name} in region {region}")
+    region = resolve_region(region, cloud)
+    backend = resolve_backend(cloud)
+    InstanceInfo = backend.InstanceInfo
+    InstanceStatus = backend.InstanceStatus
 
-    client = ClientUtils.get_ec2_client(region=region)
+    logger.info(f"Listing instances with project={name} in region {region} ({cloud})")
 
     instances = InstanceInfo.describe_instances(
         region=region,
         project=name,
         statuses=InstanceStatus.unterminated(),
-        client=client,
+        **({"gcp_project": gcp_project} if cloud == "gcp" else {}),
     )
     logger.info(f"Found {len(instances)} matching instances")
 
@@ -693,54 +891,69 @@ def list_instances(
         if instance_id is not None and instance.instance_id not in instance_id:
             continue
 
-        print(f"Id:     {instance.pretty_id}")
-        print(f"Name:   {instance.name}")
-        print(f"Type:   {instance.instance_type}")
-        print(f"State:  {instance.pretty_state}")
-        print(f"IP:     {instance.pretty_ip}")
-        print(f"Status: {instance.pretty_checks}")
-        print(f"Tags:   {json.dumps(instance.tags, sort_keys=True)}")
+        # on GCP, name is name as ID, no need to double print
+        if instance.instance_id == instance.name:
+            print(f"Id/Name: {instance.pretty_id}")
+        else:
+            print(f"Id:      {instance.pretty_id}")
+            print(f"Name:    {instance.name}")
+
+        # rest of info is shared between AWS and GCP
+        print(f"Type:    {instance.instance_type}")
+        print(f"State:   {instance.pretty_state}")
+        print(f"IP:      {instance.pretty_ip}")
+        print(f"Status:  {instance.pretty_checks}")
+
+        # tags are separted, one per line.
+        # set indent to same as other fields
+        pretty_tags = re.sub(r"\n", r"\n         ", instance.pretty_tags)
+        print(f"Tags:    {pretty_tags}")
 
         if i < len(instances) - 1:
-            # add separator before next instance
             print()
 
 
 @common_cli_options
 def terminate_instances(
     name: str,
-    region: str,
+    region: str | None,
     instance_id: list[str] | None,
     detach: bool,
     parallelism: int | None,
+    cloud: str,
+    gcp_project: str | None,
     **kwargs,
 ):
     """
-    Terminate EC2 instances in a cluster.
+    Terminate instances in a cluster.
 
-    Selects unterminated instances by cluster tag, optionally filters to specific
-    instance IDs, and sends termination requests. By default, waits for each
-    termination call; with `--detach`, requests are sent without waiting.
+    Selects unterminated instances by cluster tag/label, optionally filters to
+    specific instance IDs, and sends termination/deletion requests.
 
     \f
 
     Args:
-        name: Cluster name used to select instances via the `Project` tag.
-        region: AWS region where instances are terminated.
+        name: Cluster name used to select instances via the `Project` tag/label.
+        region: Cloud region where instances are terminated.
         instance_id: Optional instance IDs to terminate.
         detach: If `True`, do not wait for instance termination to complete.
         parallelism: Maximum number of instances to terminate concurrently.
+        cloud: Cloud provider (aws or gcp).
+        gcp_project: GCP project ID.
         **kwargs: Additional CLI options injected by shared decorators; ignored here.
     """
-    logger.info(f"Terminating instances with project={name} in region {region}")
+    region = resolve_region(region, cloud)
+    backend = resolve_backend(cloud)
+    InstanceInfo = backend.InstanceInfo
+    InstanceStatus = backend.InstanceStatus
 
-    client = ClientUtils.get_ec2_client(region=region)
+    logger.info(f"Terminating instances with project={name} in region {region} ({cloud})")
 
     instances = InstanceInfo.describe_instances(
         region=region,
         project=name,
         statuses=InstanceStatus.unterminated(),
-        client=client,
+        **({"gcp_project": gcp_project} if cloud == "gcp" else {}),
     )
     logger.info(f"Found {len(instances)} instances matching the specified tags")
 
@@ -749,10 +962,9 @@ def terminate_instances(
         instances = [instance for instance in instances if instance.instance_id in instance_id]
         logger.info(f"After filtering, {len(instances)} instances will be terminated")
 
-    def terminate_single(instance: InstanceInfo) -> bool:
+    def terminate_single(instance) -> bool:
         logger.info(f"Terminating instance {instance.instance_id} ({instance.name})")
-        op_client = ClientUtils.get_ec2_client(region=region)
-        return instance.terminate(wait_for_termination=not detach, client=op_client)
+        return instance.terminate(wait_for_termination=not detach)
 
     terminated, errors = run_in_parallel(
         instances,
@@ -775,38 +987,41 @@ def terminate_instances(
 @common_cli_options
 def pause_instances(
     name: str,
-    region: str,
+    region: str | None,
     instance_id: list[str] | None,
     detach: bool,
     parallelism: int | None,
+    cloud: str,
+    gcp_project: str | None,
     **kwargs,
 ):
     """
-    Pause (stop) running EC2 instances in a cluster.
-
-    Finds running instances for the cluster, optionally filters to explicit
-    instance IDs, and issues stop requests. By default, waits for each stop call;
-    with `--detach`, requests are issued without waiting for completion.
+    Pause (stop) running instances in a cluster.
 
     \f
 
     Args:
-        name: Cluster name used to select instances via the `Project` tag.
-        region: AWS region where instances are stopped.
+        name: Cluster name used to select instances via the `Project` tag/label.
+        region: Cloud region where instances are stopped.
         instance_id: Optional instance IDs to stop.
         detach: If `True`, do not wait for stop operations to complete.
         parallelism: Maximum number of instances to stop concurrently.
+        cloud: Cloud provider (aws or gcp).
+        gcp_project: GCP project ID.
         **kwargs: Additional CLI options injected by shared decorators; ignored here.
     """
-    logger.info(f"Pausing instances with project={name} in region {region}")
+    region = resolve_region(region, cloud)
+    backend = resolve_backend(cloud)
+    InstanceInfo = backend.InstanceInfo
+    InstanceStatus = backend.InstanceStatus
 
-    client = ClientUtils.get_ec2_client(region=region)
+    logger.info(f"Pausing instances with project={name} in region {region} ({cloud})")
 
     instances = InstanceInfo.describe_instances(
         region=region,
         project=name,
         statuses=[InstanceStatus.RUNNING],
-        client=client,
+        **({"gcp_project": gcp_project} if cloud == "gcp" else {}),
     )
     logger.info(f"Found {len(instances)} instances matching the specified tags")
 
@@ -815,10 +1030,9 @@ def pause_instances(
         instances = [instance for instance in instances if instance.instance_id in instance_id]
         logger.info(f"After filtering, {len(instances)} instances will be paused")
 
-    def pause_single(instance: InstanceInfo) -> bool:
+    def pause_single(instance) -> bool:
         logger.info(f"Pausing instance {instance.instance_id} ({instance.name})")
-        op_client = ClientUtils.get_ec2_client(region=region)
-        return instance.pause(wait_for_completion=not detach, client=op_client)
+        return instance.pause(wait_for_completion=not detach)
 
     paused, errors = run_in_parallel(
         instances,
@@ -839,38 +1053,41 @@ def pause_instances(
 @common_cli_options
 def resume_instances(
     name: str,
-    region: str,
+    region: str | None,
     instance_id: list[str] | None,
     detach: bool,
     parallelism: int | None,
+    cloud: str,
+    gcp_project: str | None,
     **kwargs,
 ):
     """
-    Resume (start) stopped EC2 instances in a cluster.
-
-    Finds stopped instances for the cluster, optionally filters to explicit
-    instance IDs, and starts each selected instance. By default, waits for each
-    start request; with `--detach`, requests are sent without waiting.
+    Resume (start) stopped instances in a cluster.
 
     \f
 
     Args:
-        name: Cluster name used to select instances via the `Project` tag.
-        region: AWS region where instances are started.
+        name: Cluster name used to select instances via the `Project` tag/label.
+        region: Cloud region where instances are started.
         instance_id: Optional instance IDs to start.
         detach: If `True`, do not wait for start operations to complete.
         parallelism: Maximum number of instances to start concurrently.
+        cloud: Cloud provider (aws or gcp).
+        gcp_project: GCP project ID.
         **kwargs: Additional CLI options injected by shared decorators; ignored here.
     """
-    client = ClientUtils.get_ec2_client(region=region)
+    region = resolve_region(region, cloud)
+    backend = resolve_backend(cloud)
+    InstanceInfo = backend.InstanceInfo
+    InstanceStatus = backend.InstanceStatus
 
-    logger.info(f"Resuming instances with project={name} in region {region}")
+    logger.info(f"Resuming instances with project={name} in region {region} ({cloud})")
 
     instances = InstanceInfo.describe_instances(
         region=region,
         project=name,
         statuses=[InstanceStatus.STOPPED],
-        client=client,
+        **({"gcp_project": gcp_project} if cloud == "gcp" else {}),
     )
     logger.info(f"Found {len(instances)} instances matching the specified tags")
 
@@ -879,10 +1096,9 @@ def resume_instances(
         instances = [instance for instance in instances if instance.instance_id in instance_id]
         logger.info(f"After filtering, {len(instances)} instances will be resumed")
 
-    def resume_single(instance: InstanceInfo) -> bool:
+    def resume_single(instance) -> bool:
         logger.info(f"Resuming instance {instance.instance_id} ({instance.name})")
-        op_client = ClientUtils.get_ec2_client(region=region)
-        return instance.resume(wait_for_completion=not detach, client=op_client)
+        return instance.resume(wait_for_completion=not detach)
 
     resumed, errors = run_in_parallel(
         instances,
@@ -905,43 +1121,50 @@ def resume_instances(
 @common_cli_options
 def run_command(
     name: str,
-    region: str,
+    region: str | None,
     instance_id: list[str] | None,
     command: str | None,
     script: str | None,
     ssh_key_path: str,
     detach: bool,
     spindown: bool,
-    instance_username: str,
+    instance_username: str | None,
+    cloud: str,
+    gcp_project: str | None,
     parallelism: int | None = None,
     timeout: int | None = None,
+    owner: str | None = None,
     **kwargs,
 ):
     """
-    Run a command or script on EC2 instances.
-
-    Targets running instances in the cluster, optionally narrows to explicit
-    instance IDs, and executes the command over SSH. Commands can run in detached
-    mode, execute in parallel with bounded worker count, and optionally append a
-    self-termination command to each instance after execution.
+    Run a command or script on instances.
 
     \f
 
     Args:
-        name: Cluster name used to select instances via the `Project` tag.
-        region: AWS region where commands are executed.
+        name: Cluster name used to select instances via the `Project` tag/label.
+        region: Cloud region where commands are executed.
         instance_id: Optional instance IDs to target.
         command: Shell command to run remotely; mutually exclusive with `script`.
         script: Local script path to upload/run; mutually exclusive with `command`.
         ssh_key_path: Path to the local private SSH key for authentication.
         detach: If `True`, run in detached mode via the `Session` backend.
-        spindown: If `True`, append EC2 terminate command after the main command.
+        spindown: If `True`, append self-termination command after the main command.
         instance_username: Username used for SSH connections.
+        cloud: Cloud provider (aws or gcp).
+        gcp_project: GCP project ID.
         parallelism: Maximum number of concurrent remote executions.
         timeout: Optional per-instance command timeout in seconds.
+        owner: Owner value.
         **kwargs: Additional CLI options injected by shared decorators; ignored here.
     """
-    logger.info(f"Running command on instances with project={name} in region {region}")
+    region = resolve_region(region, cloud)
+    backend = resolve_backend(cloud)
+    InstanceInfo = backend.InstanceInfo
+    InstanceStatus = backend.InstanceStatus
+    instance_username = resolve_instance_username(instance_username, cloud, owner or "")
+
+    logger.info(f"Running command on instances with project={name} in region {region} ({cloud})")
 
     if command is None and script is None:
         raise click.UsageError("Either --command or --script must be provided")
@@ -949,7 +1172,11 @@ def run_command(
     if command is not None and script is not None:
         raise click.UsageError("--command and --script cannot both be provided")
 
-    instances = InstanceInfo.describe_instances(region=region, project=name)
+    instances = InstanceInfo.describe_instances(
+        region=region,
+        project=name,
+        **({"gcp_project": gcp_project} if cloud == "gcp" else {}),
+    )
     logger.info(f"Found {len(instances)} instances matching the specified tags")
 
     if instance_id is not None:
@@ -974,19 +1201,34 @@ def run_command(
     max_workers = len(instances) if parallelism is None else min(parallelism, len(instances))
     logger.info(f"Running command on {len(instances)} instances with max parallelism={max_workers}")
 
-    def run_on_instance(instance: "InstanceInfo") -> tuple[str, str]:
+    def _spindown_command(instance_id_val: str) -> str:
+        if cloud == "gcp":
+            return (
+                "ZONE=$(curl -s -H 'Metadata-Flavor: Google' "
+                "http://metadata.google.internal/computeMetadata/v1/instance/zone "
+                "| rev | cut -d/ -f1 | rev) && "
+                "gcloud compute instances delete $(hostname) --zone=$ZONE --quiet"
+            )
+        else:
+            return f"aws ec2 terminate-instances --instance-ids {instance_id_val}"
+
+    def run_on_instance(instance) -> tuple[str, str]:
+        from .ssh_session import Session
+
         logger.info(f"Running command on instance {instance.instance_id} ({instance.name})")
 
         command_to_run = base_command_to_run
 
         if spindown:
-            command_to_run = f"{command_to_run}; aws ec2 terminate-instances --instance-ids {instance.instance_id}"
+            command_to_run = f"{command_to_run}; {_spindown_command(instance.instance_id)}"
 
         session = Session(
             instance_id=instance.instance_id,
             region=region,
             private_key_path=ssh_key_path,
             user=instance_username,
+            cloud=cloud,
+            gcp_project=gcp_project,
         )
         output_ = session.run(command_to_run, detach=detach, timeout=timeout)
         return instance.instance_id, str(output_)
@@ -1022,64 +1264,81 @@ def run_command(
 @common_cli_options
 def setup_instances(
     name: str,
-    region: str,
+    region: str | None,
     owner: str,
     instance_id: list[str] | None,
     ssh_key_path: str,
-    instance_username: str,
+    instance_username: str | None,
+    cloud: str,
+    gcp_project: str | None,
     **kwargs,
 ):
     """
-    Configure base runtime prerequisites on EC2 instances.
+    Configure base runtime prerequisites on instances.
 
-    Reads local AWS credentials, writes `~/.aws/config` and
-    `~/.aws/credentials` on target instances, and installs GNU `screen`. This is
-    the shared bootstrap step used by higher-level setup commands.
+    For AWS: pushes `~/.aws/credentials` and installs `screen`.
+    For GCP: installs `screen` only (service account provides access).
 
     \f
 
     Args:
-        name: Cluster name used to select instances via the `Project` tag.
-        region: AWS region where setup runs.
-        owner: Owner value used for logging and forwarded CLI compatibility.
+        name: Cluster name used to select instances via the `Project` tag/label.
+        region: Cloud region where setup runs.
+        owner: Owner value.
         instance_id: Optional instance IDs to bootstrap.
         ssh_key_path: Path to the local private SSH key for authentication.
         instance_username: Username used for SSH connections.
+        cloud: Cloud provider (aws or gcp).
+        gcp_project: GCP project ID.
         **kwargs: Additional CLI options injected by shared decorators; ignored here.
     """
-    logger.info(f"Setting up AWS credentials on instances with project={name}, owner={owner} in region {region}")
-
-    aws_access_key_id = get_aws_access_key_id()
-    aws_secret_access_key = get_aws_secret_access_key()
-
-    if aws_access_key_id is None or aws_secret_access_key is None:
-        logger.error("AWS credentials not found in environment variables")
-        raise ValueError(
-            "No AWS credentials found; please set the AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables"
-        )
-
-    aws_config = make_aws_config()
-    aws_credentials = make_aws_credentials(
-        aws_access_key_id=aws_access_key_id, aws_secret_access_key=aws_secret_access_key
-    )
-
-    # Base64-encode config files and screen installer for transfer
-    aws_config_base64 = base64.b64encode(aws_config.encode("utf-8")).decode("utf-8")
-    aws_credentials_base64 = base64.b64encode(aws_credentials.encode("utf-8")).decode("utf-8")
+    region = resolve_region(region, cloud)
+    instance_username = resolve_instance_username(instance_username, cloud, owner)
 
     screen_install = f"{PACKAGE_MANAGER_DETECTOR} sudo ${{PKG_MANAGER}} install -y screen"
     screen_install_base64 = base64.b64encode(screen_install.encode("utf-8")).decode("utf-8")
 
-    setup_command = [
-        "mkdir -p ~/.aws",
-        f"echo '{aws_config_base64}' | base64 -d > ~/.aws/config",
-        f"echo '{aws_credentials_base64}' | base64 -d > ~/.aws/credentials",
-        f"echo '{screen_install_base64}' | base64 -d > screen_setup.sh",
-        "chmod +x screen_setup.sh",
-        "./screen_setup.sh",
-    ]
+    if cloud == "gcp":
+        logger.info(f"Setting up screen on GCP instances with project={name}, owner={owner} in region {region}")
+        setup_command = [
+            f"echo '{screen_install_base64}' | base64 -d > screen_setup.sh",
+            "chmod +x screen_setup.sh",
+            "./screen_setup.sh",
+        ]
+    else:
+        from .utils import get_aws_access_key_id, get_aws_secret_access_key, make_aws_config, make_aws_credentials
 
-    logger.info("Running AWS credential setup command on instances")
+        logger.info(
+            f"Setting up AWS credentials on instances with project={name}, owner={owner} in region {region}"
+        )
+
+        aws_access_key_id = get_aws_access_key_id()
+        aws_secret_access_key = get_aws_secret_access_key()
+
+        if aws_access_key_id is None or aws_secret_access_key is None:
+            logger.error("AWS credentials not found in environment variables")
+            raise ValueError(
+                "No AWS credentials found; please set the AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables"
+            )
+
+        aws_config = make_aws_config()
+        aws_credentials = make_aws_credentials(
+            aws_access_key_id=aws_access_key_id, aws_secret_access_key=aws_secret_access_key
+        )
+
+        aws_config_base64 = base64.b64encode(aws_config.encode("utf-8")).decode("utf-8")
+        aws_credentials_base64 = base64.b64encode(aws_credentials.encode("utf-8")).decode("utf-8")
+
+        setup_command = [
+            "mkdir -p ~/.aws",
+            f"echo '{aws_config_base64}' | base64 -d > ~/.aws/config",
+            f"echo '{aws_credentials_base64}' | base64 -d > ~/.aws/credentials",
+            f"echo '{screen_install_base64}' | base64 -d > screen_setup.sh",
+            "chmod +x screen_setup.sh",
+            "./screen_setup.sh",
+        ]
+
+    logger.info("Running setup command on instances")
     run_command(
         name=name,
         region=region,
@@ -1092,40 +1351,45 @@ def setup_instances(
         spindown=False,
         screen=True,
         instance_username=instance_username,
+        cloud=cloud,
+        gcp_project=gcp_project,
     )
-    logger.info("AWS credential setup completed")
+    logger.info("Setup completed")
 
 
 @common_cli_options
 def setup_dolma2_toolkit(
     name: str,
-    region: str,
+    region: str | None,
     owner: str,
     instance_id: list[str] | None,
     ssh_key_path: str,
     detach: bool,
-    instance_username: str,
+    instance_username: str | None,
+    cloud: str,
+    gcp_project: str | None,
     **kwargs,
 ):
     """
-    Install and configure the Dolma2 toolkit on EC2 instances.
-
-    Runs the base `setup` bootstrap first (AWS credentials and `screen`), then
-    executes the Dolma2 setup script on selected instances. The setup stage can be
-    detached so installation continues in the background.
+    Install and configure the Dolma2 toolkit on instances.
 
     \f
 
     Args:
-        name: Cluster name used to select instances via the `Project` tag.
-        region: AWS region where setup runs.
-        owner: Owner value used for logging and forwarded CLI compatibility.
+        name: Cluster name.
+        region: Cloud region.
+        owner: Owner value.
         instance_id: Optional instance IDs to configure.
-        ssh_key_path: Path to the local private SSH key for authentication.
-        detach: If `True`, run toolkit setup commands in detached mode.
+        ssh_key_path: Path to the local private SSH key.
+        detach: If `True`, run setup in detached mode.
         instance_username: Username used for SSH connections.
-        **kwargs: Additional CLI options injected by shared decorators; ignored here.
+        cloud: Cloud provider.
+        gcp_project: GCP project ID.
+        **kwargs: Ignored.
     """
+    region = resolve_region(region, cloud)
+    instance_username = resolve_instance_username(instance_username, cloud, owner)
+
     setup_instances(
         name=name,
         region=region,
@@ -1134,6 +1398,8 @@ def setup_dolma2_toolkit(
         ssh_key_path=ssh_key_path,
         instance_username=instance_username,
         detach=False,
+        cloud=cloud,
+        gcp_project=gcp_project,
     )
 
     base64_encoded_setup_command = base64.b64encode(D2TK_SETUP.encode("utf-8")).decode("utf-8")
@@ -1156,6 +1422,8 @@ def setup_dolma2_toolkit(
         spindown=False,
         screen=True,
         instance_username=instance_username,
+        cloud=cloud,
+        gcp_project=gcp_project,
     )
     logger.info("Dolma2 toolkit setup completed")
 
@@ -1163,33 +1431,36 @@ def setup_dolma2_toolkit(
 @common_cli_options
 def setup_dolma_python(
     name: str,
-    region: str,
+    region: str | None,
     owner: str,
     instance_id: list[str] | None,
     ssh_key_path: str,
     detach: bool,
-    instance_username: str,
+    instance_username: str | None,
+    cloud: str,
+    gcp_project: str | None,
     **kwargs,
 ):
     """
-    Install and configure Dolma Python on EC2 instances.
-
-    Runs the base `setup` bootstrap first (AWS credentials and `screen`), then
-    executes the Dolma Python setup script on selected instances. The setup stage
-    can be detached so installation continues in the background.
+    Install and configure Dolma Python on instances.
 
     \f
 
     Args:
-        name: Cluster name used to select instances via the `Project` tag.
-        region: AWS region where setup runs.
-        owner: Owner value used for logging and forwarded CLI compatibility.
+        name: Cluster name.
+        region: Cloud region.
+        owner: Owner value.
         instance_id: Optional instance IDs to configure.
-        ssh_key_path: Path to the local private SSH key for authentication.
-        detach: If `True`, run setup commands in detached mode.
+        ssh_key_path: Path to the local private SSH key.
+        detach: If `True`, run setup in detached mode.
         instance_username: Username used for SSH connections.
-        **kwargs: Additional CLI options injected by shared decorators; ignored here.
+        cloud: Cloud provider.
+        gcp_project: GCP project ID.
+        **kwargs: Ignored.
     """
+    region = resolve_region(region, cloud)
+    instance_username = resolve_instance_username(instance_username, cloud, owner)
+
     setup_instances(
         name=name,
         region=region,
@@ -1198,6 +1469,8 @@ def setup_dolma_python(
         ssh_key_path=ssh_key_path,
         instance_username=instance_username,
         detach=False,
+        cloud=cloud,
+        gcp_project=gcp_project,
     )
 
     base64_encoded_setup_command = base64.b64encode(DOLMA_PYTHON_SETUP.encode("utf-8")).decode("utf-8")
@@ -1220,6 +1493,8 @@ def setup_dolma_python(
         spindown=False,
         screen=True,
         instance_username=instance_username,
+        cloud=cloud,
+        gcp_project=gcp_project,
     )
     logger.info("Dolma Python setup completed")
 
@@ -1234,35 +1509,40 @@ def setup_dolma_python(
 )
 def setup_decon(
     name: str,
-    region: str,
+    region: str | None,
     owner: str,
     instance_id: list[str] | None,
     ssh_key_path: str,
     detach: bool,
     github_token: str | None,
-    instance_username: str,
+    instance_username: str | None,
+    cloud: str,
+    gcp_project: str | None,
     **kwargs,
 ):
     """
-    Install and configure DECON on EC2 instances.
-
-    Runs the base `setup` bootstrap first, then builds a per-instance DECON setup
-    script with host index metadata so workers can coordinate distributed work. The
-    optional GitHub token is used when private repository access is required.
+    Install and configure DECON on instances.
 
     \f
 
     Args:
-        name: Cluster name used to select instances via the `Project` tag.
-        region: AWS region where setup runs.
-        owner: Owner value used for logging and forwarded CLI compatibility.
+        name: Cluster name.
+        region: Cloud region.
+        owner: Owner value.
         instance_id: Optional instance IDs to configure.
-        ssh_key_path: Path to the local private SSH key for authentication.
-        detach: If `True`, run setup commands in detached mode.
-        github_token: Optional GitHub token for cloning private repositories.
+        ssh_key_path: Path to the local private SSH key.
+        detach: If `True`, run setup in detached mode.
+        github_token: Optional GitHub token.
         instance_username: Username used for SSH connections.
-        **kwargs: Additional CLI options injected by shared decorators; ignored here.
+        cloud: Cloud provider.
+        gcp_project: GCP project ID.
+        **kwargs: Ignored.
     """
+    region = resolve_region(region, cloud)
+    backend = resolve_backend(cloud)
+    InstanceInfo = backend.InstanceInfo
+    instance_username = resolve_instance_username(instance_username, cloud, owner)
+
     setup_instances(
         name=name,
         region=region,
@@ -1271,16 +1551,21 @@ def setup_decon(
         ssh_key_path=ssh_key_path,
         instance_username=instance_username,
         detach=False,
+        cloud=cloud,
+        gcp_project=gcp_project,
     )
 
-    instances = InstanceInfo.describe_instances(region=region, project=name)
+    instances = InstanceInfo.describe_instances(
+        region=region,
+        project=name,
+        **({"gcp_project": gcp_project} if cloud == "gcp" else {}),
+    )
 
     if instance_id is not None:
         instances = [instance for instance in instances if instance.instance_id in instance_id]
 
     logger.info(f"Setting up Decon on {len(instances)} instances")
 
-    # Each instance gets a unique PMR_HOST_INDEX for coordinated work
     for idx, instance in enumerate(instances):
         logger.info(
             f"Setting up Decon on instance {instance.instance_id} ({instance.name}) with PMR_HOST_INDEX={idx}"
@@ -1306,6 +1591,8 @@ def setup_decon(
             spindown=False,
             screen=True,
             instance_username=instance_username,
+            cloud=cloud,
+            gcp_project=gcp_project,
         )
 
     logger.info("Decon setup completed on all instances")
@@ -1314,34 +1601,40 @@ def setup_decon(
 @common_cli_options
 def map_commands(
     name: str,
-    region: str,
+    region: str | None,
     instance_id: list[str] | None,
     ssh_key_path: str,
     script: list[str],
     spindown: bool,
-    instance_username: str,
+    instance_username: str | None,
+    cloud: str,
+    gcp_project: str | None,
+    owner: str | None = None,
     **kwargs,
 ):
     """
-    Distribute scripts across EC2 instances and run them in parallel.
-
-    Script inputs are shuffled (with a fixed seed), split approximately evenly
-    across selected instances, copied over SSH, and wrapped in a per-instance
-    `run_all.sh`. Each wrapper is then started in detached mode so all instances
-    process their assigned scripts concurrently.
+    Distribute scripts across instances and run them in parallel.
 
     \f
 
     Args:
-        name: Cluster name used to select instances via the `Project` tag.
-        region: AWS region where scripts are dispatched.
+        name: Cluster name used to select instances via the `Project` tag/label.
+        region: Cloud region where scripts are dispatched.
         instance_id: Optional instance IDs to target.
         ssh_key_path: Path to the local private SSH key for authentication.
         script: Executable script paths to distribute across instances.
-        spindown: If `True`, append an EC2 stop command to each wrapper script.
+        spindown: If `True`, append a stop command to each wrapper script.
         instance_username: Username used for SSH connections.
+        cloud: Cloud provider (aws or gcp).
+        gcp_project: GCP project ID.
+        owner: Owner value.
         **kwargs: Additional CLI options injected by shared decorators; ignored here.
     """
+    region = resolve_region(region, cloud)
+    backend = resolve_backend(cloud)
+    InstanceInfo = backend.InstanceInfo
+    instance_username = resolve_instance_username(instance_username, cloud, owner or "")
+
     random.seed(42)
     assert isinstance(script, list) and len(script) > 0, "script must be a list with at least one script"
 
@@ -1352,7 +1645,11 @@ def map_commands(
     random.shuffle(script)
     logger.info(f"Found {len(script):,} scripts to distribute")
 
-    instances = InstanceInfo.describe_instances(region=region, project=name)
+    instances = InstanceInfo.describe_instances(
+        region=region,
+        project=name,
+        **({"gcp_project": gcp_project} if cloud == "gcp" else {}),
+    )
 
     if instance_id is not None:
         instances = [instance for instance in instances if instance.instance_id in instance_id]
@@ -1364,7 +1661,6 @@ def map_commands(
 
     transfer_scripts_commands: list[list[str]] = []
 
-    # Split scripts evenly across instances and build transfer commands
     for i, instance in enumerate(instances):
         ratio = len(script) / len(instances)
         start_idx = round(ratio * i)
@@ -1373,7 +1669,6 @@ def map_commands(
 
         transfer_scripts_commands.append([])
 
-        # Create job directory and run_all.sh wrapper
         transfer_scripts_commands[-1].append(f"mkdir -p {job_uuid}")
         transfer_scripts_commands[-1].append(f"echo '#!/usr/bin/env bash' >> {job_uuid}/run_all.sh")
         transfer_scripts_commands[-1].append(f"echo 'set -x' >> {job_uuid}/run_all.sh")
@@ -1396,11 +1691,26 @@ def map_commands(
             transfer_scripts_commands[-1].extend(cmds)
 
         if spindown:
-            stop_command = f"aws ec2 stop-instances --instance-ids {instance.instance_id}"
+            if cloud == "gcp":
+                stop_command = (
+                    "ZONE=$(curl -s -H 'Metadata-Flavor: Google' "
+                    "http://metadata.google.internal/computeMetadata/v1/instance/zone "
+                    "| rev | cut -d/ -f1 | rev) && "
+                    "gcloud compute instances stop $(hostname) --zone=$ZONE --quiet"
+                )
+            else:
+                stop_command = f"aws ec2 stop-instances --instance-ids {instance.instance_id}"
             transfer_scripts_commands[-1].append(f"echo '{stop_command}'>> {job_uuid}/run_all.sh")
 
     runner_fn = partial(
-        run_command, name=name, region=region, ssh_key_path=ssh_key_path, script=None, spindown=False
+        run_command,
+        name=name,
+        region=region,
+        ssh_key_path=ssh_key_path,
+        script=None,
+        spindown=False,
+        cloud=cloud,
+        gcp_project=gcp_project,
     )
 
     for instance, setup_commands in zip(instances, transfer_scripts_commands):
@@ -1440,38 +1750,47 @@ WAIT_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "�
 )
 def wait_instances(
     name: str,
-    region: str,
+    region: str | None,
     instance_id: list[str] | None,
     ssh_key_path: str,
     timeout: int | None,
-    instance_username: str,
+    instance_username: str | None,
     command: str | None,
     script: str | None,
     poll_interval: int,
+    cloud: str,
+    gcp_project: str | None,
+    owner: str | None = None,
     **kwargs,
 ):
     """
     Wait until all instances in a cluster are ready.
 
-    Polls EC2 status checks until all selected instances are running and healthy.
-    Optionally runs a readiness command/script over SSH for each instance and only
-    reports success when that command exits cleanly everywhere. Progress is shown
-    interactively with a spinner until all instances are ready or timeout is hit.
-
     \f
 
     Args:
-        name: Cluster name used to select instances via the `Project` tag.
-        region: AWS region where instances are polled.
+        name: Cluster name.
+        region: Cloud region.
         instance_id: Optional instance IDs to wait for.
-        ssh_key_path: Path to the local private SSH key for authentication.
-        timeout: Optional overall timeout in seconds; waits indefinitely if unset.
+        ssh_key_path: Path to the local private SSH key.
+        timeout: Optional overall timeout in seconds.
         instance_username: Username used for SSH readiness checks.
-        command: Optional readiness command that must succeed on each instance.
-        script: Optional readiness script path that must succeed on each instance.
-        poll_interval: Polling interval in seconds between readiness checks.
-        **kwargs: Additional CLI options injected by shared decorators; ignored here.
+        command: Optional readiness command.
+        script: Optional readiness script path.
+        poll_interval: Polling interval in seconds.
+        cloud: Cloud provider.
+        gcp_project: GCP project ID.
+        owner: Owner value.
+        **kwargs: Ignored.
     """
+    from .ssh_session import Session
+
+    region = resolve_region(region, cloud)
+    backend = resolve_backend(cloud)
+    InstanceInfo = backend.InstanceInfo
+    InstanceStatus = backend.InstanceStatus
+    instance_username = resolve_instance_username(instance_username, cloud, owner or "")
+
     ready_command: str | None = None
     if script is not None:
         ready_command = script_to_command(script, to_file=True)
@@ -1488,12 +1807,11 @@ def wait_instances(
             logger.error(f"Timed out after {timeout}s waiting for instances to be ready")
             raise click.ClickException(f"Timed out after {timeout}s waiting for instances to be ready")
 
-        client = ClientUtils.get_ec2_client(region=region)
         instances = InstanceInfo.describe_instances(
             region=region,
             project=name,
             statuses=InstanceStatus.unterminated(),
-            client=client,
+            **({"gcp_project": gcp_project} if cloud == "gcp" else {}),
         )
 
         if instance_id is not None:
@@ -1505,16 +1823,7 @@ def wait_instances(
 
         total = len(instances)
 
-        def check_instance(inst: InstanceInfo) -> tuple[InstanceInfo, bool]:
-            """
-            Check whether one instance is ready.
-
-            Args:
-                inst: Instance to evaluate.
-
-            Returns:
-                tuple[InstanceInfo, bool]: The original instance and its readiness status.
-            """
+        def check_instance(inst) -> tuple:
             all_checks = len(inst._status)
             ok_checks = sum(1 for _, s in inst._status if s == "ok")
             healthy = inst.state == InstanceStatus.RUNNING and all_checks > 0 and ok_checks == all_checks
@@ -1526,6 +1835,8 @@ def wait_instances(
                         region=region,
                         private_key_path=ssh_key_path,
                         user=instance_username,
+                        cloud=cloud,
+                        gcp_project=gcp_project,
                     )
                     check = session.run_single(
                         f"{ready_command} && echo __READY__ || echo __NOT_READY__", timeout=30
@@ -1537,7 +1848,7 @@ def wait_instances(
 
             return inst, healthy
 
-        results: list[tuple[InstanceInfo, bool]] = []
+        results: list[tuple] = []
         with ThreadPoolExecutor(max_workers=min(total, 32)) as pool:
             futures = {pool.submit(check_instance, inst): inst for inst in instances}
             for future in as_completed(futures):
@@ -1559,7 +1870,7 @@ def wait_instances(
         frame_idx += 1
         elapsed_str = f"{int(elapsed)}s"
 
-        click.echo("\033[2J\033[H", nl=False)  # clear screen, cursor to top
+        click.echo("\033[2J\033[H", nl=False)
         if ready_count == total:
             click.echo(f"\033[92m✓\033[0m All {total} instance(s) ready! ({elapsed_str})\n")
             for detail in instance_details:
@@ -1579,36 +1890,42 @@ def wait_instances(
 @common_cli_options
 def ssh_instance(
     name: str,
-    region: str,
+    region: str | None,
     instance_id: list[str] | None,
     ssh_key_path: str,
-    instance_username: str,
+    instance_username: str | None,
+    cloud: str,
+    gcp_project: str | None,
+    owner: str | None = None,
     **kwargs,
 ):
     """
-    Open an interactive SSH session to a running EC2 instance.
-
-    Finds running instances in the cluster, optionally filters by explicit
-    instance IDs, and prompts for selection when multiple candidates remain. The
-    current process is then replaced with a local `ssh` command.
+    Open an interactive SSH session to a running instance.
 
     \f
 
     Args:
-        name: Cluster name used to select instances via the `Project` tag.
-        region: AWS region where instances are queried.
+        name: Cluster name.
+        region: Cloud region.
         instance_id: Optional instance IDs to allow as SSH targets.
-        ssh_key_path: Path to the local private SSH key for authentication.
+        ssh_key_path: Path to the local private SSH key.
         instance_username: Username used for SSH connections.
-        **kwargs: Additional CLI options injected by shared decorators; ignored here.
+        cloud: Cloud provider.
+        gcp_project: GCP project ID.
+        owner: Owner value.
+        **kwargs: Ignored.
     """
-    client = ClientUtils.get_ec2_client(region=region)
+    region = resolve_region(region, cloud)
+    backend = resolve_backend(cloud)
+    InstanceInfo = backend.InstanceInfo
+    InstanceStatus = backend.InstanceStatus
+    instance_username = resolve_instance_username(instance_username, cloud, owner or "")
 
     instances = InstanceInfo.describe_instances(
         region=region,
         project=name,
         statuses=[InstanceStatus.RUNNING],
-        client=client,
+        **({"gcp_project": gcp_project} if cloud == "gcp" else {}),
     )
 
     if instance_id is not None:
@@ -1621,7 +1938,6 @@ def ssh_instance(
     if len(instances) == 1:
         target = instances[0]
     else:
-        # Present selection menu
         click.echo("Multiple instances available:\n")
         for i, inst in enumerate(instances, 1):
             click.echo(f"  {i}) {inst.name}  {inst.pretty_id}  {inst.pretty_ip}")

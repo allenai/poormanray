@@ -4,6 +4,7 @@ __all__ = [
     "DOLMA_PYTHON_SETUP",
     "make_decon_python_setup",
     "DECON_PYTHON_SETUP",
+    "GCS_TOOLS_SETUP",
 ]
 
 
@@ -268,3 +269,26 @@ make evals-s3
 
 # Keep the default for backward compatibility
 DECON_PYTHON_SETUP = make_decon_python_setup()
+
+
+GCS_TOOLS_SETUP = f"""
+#!/bin/bash
+{PACKAGE_MANAGER_DETECTOR}
+
+# Install gcloud CLI if not present
+if ! command -v gcloud &>/dev/null; then
+    echo "Installing Google Cloud CLI..."
+    if [[ "$PKG_MANAGER" == "apt" ]]; then
+        sudo apt-get install -y apt-transport-https ca-certificates gnupg curl
+        curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
+        echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" | sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list
+        sudo apt-get update && sudo apt-get install -y google-cloud-cli
+    else
+        curl -O https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-linux-x86_64.tar.gz
+        tar -xf google-cloud-cli-linux-x86_64.tar.gz
+        ./google-cloud-sdk/install.sh --quiet
+        source ~/google-cloud-sdk/path.bash.inc
+    fi
+fi
+echo "gcloud CLI is available: $(which gcloud)"
+""".strip()
