@@ -73,6 +73,12 @@ def resolve_instance_username(username: str | None, cloud: str, owner: str) -> s
     return owner if cloud == "gcp" else "ec2-user"
 
 
+def resolve_instance_type(instance_type: str | None, cloud: str) -> str:
+    if instance_type is not None:
+        return instance_type
+    return "n2-standard-4" if cloud == "gcp" else "i4i.xlarge"
+
+
 def make_tags(name: str, owner: str, project: str | None, cloud: str) -> dict[str, str]:
     if cloud == "gcp":
         from .gcp_instance import _sanitize_label_value
@@ -197,7 +203,13 @@ def base_cli_options(f: T) -> T:
             callback=_parse_project_name,
             help="Ai2 project name; either specified here or by using syntax `name@project`",
         ),
-        click.option("-r", "--region", type=str, default=None, help="Region (default: us-east-1 for AWS, us-central1 for GCP)"),
+        click.option(
+            "-r",
+            "--region",
+            type=str,
+            default=None,
+            help="Region (default: us-east-1 for AWS, us-central1 for GCP)",
+        ),
         click.option(
             "-o",
             "--owner",
@@ -254,7 +266,13 @@ def common_cli_options(f: T) -> T:
             return value
 
     click_decorators = [
-        click.option("-t", "--instance-type", type=str, default="i4i.xlarge", help="Instance type"),
+        click.option(
+            "-t",
+            "--instance-type",
+            type=str,
+            default=None,
+            help="Instance type (default: i4i.xlarge for AWS, n2-standard-4 for GCP)",
+        ),
         click.option("-N", "--number", type=int, default=1, help="Number of instances"),
         click.option("-T", "--timeout", type=int, default=None, help="Timeout for the command"),
         click.option(
@@ -417,6 +435,7 @@ def create_instances(
         **kwargs: Additional CLI options injected by shared decorators; ignored here.
     """
     region = resolve_region(region, cloud)
+    instance_type = resolve_instance_type(instance_type, cloud)
     backend = resolve_backend(cloud)
 
     logger.info(f"Creating {number} instances of type {instance_type} in region {region} ({cloud})")
@@ -878,7 +897,9 @@ def list_instances(
         print(f"State:  {instance.pretty_state}")
         print(f"IP:     {instance.pretty_ip}")
         print(f"Status: {instance.pretty_checks}")
-        print(f"Tags:   {json.dumps(instance.tags, sort_keys=True)}")
+
+        # tags are separted, one per line
+        print(f"Tags:\n{instance.pretty_tags}")
 
         if i < len(instances) - 1:
             print()
@@ -1279,7 +1300,9 @@ def setup_instances(
     else:
         from .utils import get_aws_access_key_id, get_aws_secret_access_key, make_aws_config, make_aws_credentials
 
-        logger.info(f"Setting up AWS credentials on instances with project={name}, owner={owner} in region {region}")
+        logger.info(
+            f"Setting up AWS credentials on instances with project={name}, owner={owner} in region {region}"
+        )
 
         aws_access_key_id = get_aws_access_key_id()
         aws_secret_access_key = get_aws_secret_access_key()

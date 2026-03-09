@@ -8,6 +8,8 @@ import subprocess
 from enum import Enum
 from typing import Any, Optional
 
+import yaml
+
 from . import logger
 
 try:
@@ -297,6 +299,18 @@ class InstanceInfo:
         return f"\033[1m{self.instance_id}\033[0m"
 
     @property
+    def pretty_tags(self) -> str:
+        yaml_str = yaml.safe_dump(self.tags)
+
+        # bold keys
+        yaml_str = re.sub(r"(\n|^)([^\s:]+):", r"\1\033[1m\2\033[0m:", yaml_str)
+
+        # increase indetation by 2 spaces
+        yaml_str = re.sub(r"(\n|^)", r"\1    ", yaml_str)
+
+        return yaml_str
+
+    @property
     def pretty_ip(self) -> str:
         return f"\033[3m{self.public_ip_address or '·'}\033[0m"
 
@@ -415,7 +429,7 @@ class InstanceInfo:
 
         request = compute_v1.AggregatedListInstancesRequest(
             project=gcp_project_resolved,
-            **({"filter": filter_str} if filter_str else {}),
+            **({"filter": filter_str} if filter_str is not None else {}),  # pyright: ignore
         )
 
         instances: list[InstanceInfo] = []

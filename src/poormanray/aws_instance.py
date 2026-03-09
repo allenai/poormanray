@@ -6,6 +6,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any, Optional, Union
 
 import boto3
+import yaml
 from botocore.exceptions import ClientError
 
 from . import logger
@@ -395,6 +396,18 @@ class InstanceInfo:
     def pretty_ip(self) -> str:
         # make the ip address italic
         return f"\033[3m{self.public_ip_address or '·'}\033[0m"
+
+    @property
+    def pretty_tags(self) -> str:
+        yaml_str = yaml.safe_dump(self.tags)
+
+        # bold keys
+        yaml_str = re.sub(r"(\n|^)([^\s:]+):", r"\1\033[1m\2\033[0m:", yaml_str)
+
+        # increase indetation by 2 spaces
+        yaml_str = re.sub(r"(\n|^)", r"\1    ", yaml_str)
+
+        return yaml_str
 
     @classmethod
     def from_instance(
