@@ -2,7 +2,7 @@
 
 This file provides context for code agents (Claude Code, OpenAI Codex, etc.) when working on this repository.
 
-**IMPORTANT: Always use `uv` for all Python commands.** This project uses `uv` for dependency management. Never use bare `python`, `pip`, or `pytest` — always prefix with `uv run`. For example: `uv run python -c "..."`, not `python -c "..."`.
+**NOTE FOR CLAUDE**: If you are Claude, **DO NOT** update `CLAUDE.md`; update `AGENTS.md` instead. `CLAUDE.md` is just a hard-link to `AGENTS.md`.
 
 ## Project Overview
 
