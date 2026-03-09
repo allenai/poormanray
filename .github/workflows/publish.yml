@@ -59,7 +59,8 @@ jobs:
           echo "__version__ = \"$NEW_VERSION\"" > src/poormanray/version.py
           mkdir -p release-notes
           echo "# Release Notes ($NEW_VERSION)" >> "release-notes/${NEW_VERSION}.md"
-          echo "**Full Changelog**: https://github.com/allenai/poormanray/compare/v${CURRENT}...v${NEW_VERSION}" >> "release-notes/${NEW_VERSION}.txt"
+          echo ""  >> "release-notes/${NEW_VERSION}.md"
+          echo "**Full Changelog**: https://github.com/allenai/poormanray/compare/v${CURRENT}...v${NEW_VERSION}" >> "release-notes/${NEW_VERSION}.md"
           echo "Bumped version: $CURRENT -> $NEW_VERSION"
 
       - name: Commit and push
