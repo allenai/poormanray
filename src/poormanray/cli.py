@@ -891,15 +891,23 @@ def list_instances(
         if instance_id is not None and instance.instance_id not in instance_id:
             continue
 
-        print(f"Id:     {instance.pretty_id}")
-        print(f"Name:   {instance.name}")
-        print(f"Type:   {instance.instance_type}")
-        print(f"State:  {instance.pretty_state}")
-        print(f"IP:     {instance.pretty_ip}")
-        print(f"Status: {instance.pretty_checks}")
+        # on GCP, name is name as ID, no need to double print
+        if instance.instance_id == instance.name:
+            print(f"Id/Name: {instance.pretty_id}")
+        else:
+            print(f"Id:      {instance.pretty_id}")
+            print(f"Name:    {instance.name}")
 
-        # tags are separted, one per line
-        print(f"Tags:\n{instance.pretty_tags}")
+        # rest of info is shared between AWS and GCP
+        print(f"Type:    {instance.instance_type}")
+        print(f"State:   {instance.pretty_state}")
+        print(f"IP:      {instance.pretty_ip}")
+        print(f"Status:  {instance.pretty_checks}")
+
+        # tags are separted, one per line.
+        # set indent to same as other fields
+        pretty_tags = re.sub(r"\n", r"\n         ", instance.pretty_tags)
+        print(f"Tags:    {pretty_tags}")
 
         if i < len(instances) - 1:
             print()

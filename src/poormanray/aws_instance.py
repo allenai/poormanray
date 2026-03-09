@@ -1,41 +1,18 @@
 import dataclasses as dt
 import datetime
 import os
-import re
-from enum import Enum
 from typing import TYPE_CHECKING, Any, Optional, Union
 
 import boto3
-import yaml
 from botocore.exceptions import ClientError
 
 from . import logger
+from .base_instance import BucketInfoBase, InstanceInfoBase, InstanceStatus
 
 if TYPE_CHECKING:
     from mypy_boto3_ec2.client import EC2Client
     from mypy_boto3_ec2.type_defs import InstanceStatusTypeDef, InstanceTypeDef
     from mypy_boto3_ssm.client import SSMClient
-
-
-class InstanceStatus(Enum):
-    PENDING = "pending"
-    RUNNING = "running"
-    SHUTTING_DOWN = "shutting-down"
-    TERMINATED = "terminated"
-    STOPPING = "stopping"
-    STOPPED = "stopped"
-
-    @classmethod
-    def active(cls) -> list["InstanceStatus"]:
-        return [
-            status
-            for status in cls
-            if status != cls.TERMINATED and status != cls.STOPPED and status != cls.SHUTTING_DOWN
-        ]
-
-    @classmethod
-    def unterminated(cls) -> list["InstanceStatus"]:
-        return [status for status in cls if status != cls.TERMINATED and status != cls.SHUTTING_DOWN]
 
 
 class ClientUtils:
@@ -73,23 +50,7 @@ class ClientUtils:
         return session.client("s3", region_name=region)
 
 
-class BucketInfo:
-    DEFAULT_TRANSITION_DAYS = 7
-    DEFAULT_EXPIRATION_DAYS = 7
-
-    @staticmethod
-    def validate_bucket_name(name: str) -> None:
-        """Validate S3 bucket name according to AWS naming rules."""
-        if len(name) < 3 or len(name) > 63:
-            raise ValueError(f"Bucket name must be 3-63 characters, got {len(name)}")
-        if not re.match(r"^[a-z0-9][a-z0-9.-]*[a-z0-9]$", name):
-            raise ValueError(
-                f"Invalid bucket name '{name}': must contain only lowercase letters, "
-                "digits, hyphens, and periods, and start/end with a letter or digit"
-            )
-        if ".." in name:
-            raise ValueError(f"Bucket name '{name}' cannot contain consecutive periods")
-
+class BucketInfo(BucketInfoBase):
     @staticmethod
     def _serialize_tags(tags: dict[str, str]) -> list[dict[str, str]]:
         return [{"Key": key, "Value": value} for key, value in tags.items()]
@@ -154,8 +115,8 @@ class BucketInfo:
         cls,
         bucket_name: str,
         *,
-        transition_days: int = DEFAULT_TRANSITION_DAYS,
-        expiration_days: int = DEFAULT_EXPIRATION_DAYS,
+        transition_days: int = BucketInfoBase.DEFAULT_TRANSITION_DAYS,
+        expiration_days: int = BucketInfoBase.DEFAULT_EXPIRATION_DAYS,
         client: Any = None,
     ) -> None:
         client = client or ClientUtils.get_s3_client()
@@ -176,8 +137,8 @@ class BucketInfo:
         cls,
         bucket_name: str,
         *,
-        transition_days: int = DEFAULT_TRANSITION_DAYS,
-        expiration_days: int = DEFAULT_EXPIRATION_DAYS,
+        transition_days: int = BucketInfoBase.DEFAULT_TRANSITION_DAYS,
+        expiration_days: int = BucketInfoBase.DEFAULT_EXPIRATION_DAYS,
         client: Any = None,
     ) -> bool:
         client = client or ClientUtils.get_s3_client()
@@ -222,8 +183,8 @@ class BucketInfo:
         *,
         region: str = "us-east-1",
         tags: dict[str, str] | None = None,
-        transition_days: int = DEFAULT_TRANSITION_DAYS,
-        expiration_days: int = DEFAULT_EXPIRATION_DAYS,
+        transition_days: int = BucketInfoBase.DEFAULT_TRANSITION_DAYS,
+        expiration_days: int = BucketInfoBase.DEFAULT_EXPIRATION_DAYS,
         client: Any = None,
     ) -> None:
         cls.validate_bucket_name(bucket_name)
@@ -264,8 +225,8 @@ class BucketInfo:
         bucket_name: str,
         *,
         tags: dict[str, str] | None = None,
-        transition_days: int = DEFAULT_TRANSITION_DAYS,
-        expiration_days: int = DEFAULT_EXPIRATION_DAYS,
+        transition_days: int = BucketInfoBase.DEFAULT_TRANSITION_DAYS,
+        expiration_days: int = BucketInfoBase.DEFAULT_EXPIRATION_DAYS,
         client: Any = None,
     ) -> tuple[dict[str, str], bool]:
         client = client or ClientUtils.get_s3_client()
@@ -315,7 +276,7 @@ class BucketInfo:
 
 
 @dt.dataclass(frozen=True)
-class InstanceInfo:
+class InstanceInfo(InstanceInfoBase):
     """
     Represents information about an EC2 instance.
 
@@ -335,79 +296,7 @@ class InstanceInfo:
         region: The AWS region where the instance is located
     """
 
-    instance_id: str
-    instance_type: str
-    image_id: str
-    state: InstanceStatus
-    public_ip_address: str
-    public_dns_name: str
-    name: str
-    tags: dict[str, str]
-    zone: str
-    created_at: datetime.datetime
     region: str = "us-east-1"
-    _status: list[tuple[str, str]] = dt.field(init=False, default_factory=list)
-
-    def _update_status(self, name: str, status: str):
-        self._status.append((name, status))
-
-    @property
-    def checks(self) -> str:
-        all_status = len(self._status)
-        all_ok = sum(1 for _, status in self._status if status == "ok")
-        return f"{all_ok}/{all_status}"
-
-    @property
-    def pretty_checks(self) -> str:
-        if len(self._status) == 0:
-            # bracket text in yellow
-            start, end = "\033[93m", "\033[0m"
-        elif sum(1 for _, status in self._status if status == "ok") == len(self._status):
-            # bracket text in green
-            start, end = "\033[92m", "\033[0m"
-        else:
-            # bracket text in red
-            start, end = "\033[91m", "\033[0m"
-
-        return f"{start}{self.checks}{end}"
-
-    @property
-    def pretty_state(self) -> str:
-        if self.state == InstanceStatus.RUNNING:
-            # bracket text in green
-            start, end = "\033[92m", "\033[0m"
-        elif self.state == InstanceStatus.PENDING:
-            # bracket text in blue
-            start, end = "\033[94m", "\033[0m"
-        elif self.state == InstanceStatus.SHUTTING_DOWN:
-            # bracket text in red
-            start, end = "\033[91m", "\033[0m"
-        else:
-            # bracket text in yellow
-            start, end = "\033[93m", "\033[0m"
-
-        return f"{start}{self.state.value}{end}"
-
-    @property
-    def pretty_id(self) -> str:
-        return f"\033[1m{self.instance_id}\033[0m"
-
-    @property
-    def pretty_ip(self) -> str:
-        # make the ip address italic
-        return f"\033[3m{self.public_ip_address or '·'}\033[0m"
-
-    @property
-    def pretty_tags(self) -> str:
-        yaml_str = yaml.safe_dump(self.tags)
-
-        # bold keys
-        yaml_str = re.sub(r"(\n|^)([^\s:]+):", r"\1\033[1m\2\033[0m:", yaml_str)
-
-        # increase indetation by 2 spaces
-        yaml_str = re.sub(r"(\n|^)", r"\1    ", yaml_str)
-
-        return yaml_str
 
     @classmethod
     def from_instance(
