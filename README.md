@@ -255,19 +255,19 @@ pmr map --name mycluster --script scripts/ --spindown
 
 ### Bucket Management
 
-#### `create_bucket` - Create a storage bucket
+#### `create-bucket` - Create a storage bucket
 
 Creates a bucket with private visibility, standard tags/labels, tiering (after 7 days), and hard-delete lifecycle (after 7 days).
 
 ```bash
-pmr create_bucket --name my-data-bucket@my-ai2-project
+pmr create-bucket --name my-data-bucket@my-ai2-project
 
 # GCP example
-pmr create_bucket --cloud gcp --gcp-project my-project \
+pmr create-bucket --cloud gcp --gcp-project my-project \
   --name my-data-bucket@my-ai2-project
 
 # Customize lifecycle timing
-pmr create_bucket --name my-data-bucket@my-ai2-project \
+pmr create-bucket --name my-data-bucket@my-ai2-project \
   --tier-after-days 14 --expire-after-days 30
 
 # Options:
@@ -280,38 +280,38 @@ pmr create_bucket --name my-data-bucket@my-ai2-project \
 #   --gcp-project           GCP project ID
 ```
 
-#### `update_bucket` - Backfill missing bucket settings
+#### `update-bucket` - Backfill missing bucket settings
 
 Adds missing default tags/labels and lifecycle rules without overwriting existing values. Visibility settings are never changed.
 
 ```bash
-pmr update_bucket --name my-data-bucket@my-ai2-project
+pmr update-bucket --name my-data-bucket@my-ai2-project
 ```
 
-#### `delete_bucket` - Delete a storage bucket
+#### `delete-bucket` - Delete a storage bucket
 
 Deletes a bucket. Fails if the bucket is not empty.
 
 ```bash
-pmr delete_bucket --name my-data-bucket
+pmr delete-bucket --name my-data-bucket
 
 # Skip confirmation prompt
-pmr delete_bucket --name my-data-bucket --yes
+pmr delete-bucket --name my-data-bucket --yes
 ```
 
 If the bucket is not empty, `pmr` will suggest running `s5cmd rm s3://<bucket>/*` (or `gs://` for GCP) first.
 
 ### Cluster Tag Management
 
-#### `update_cluster` - Backfill missing cluster tags/labels
+#### `update-cluster` - Backfill missing cluster tags/labels
 
 Adds missing default tags (AWS: `Project`, `Contact`, `Tool`, `ai2-project`; GCP: lowercase equivalents) to instances without overwriting existing values.
 
 ```bash
-pmr update_cluster --name mycluster@my-ai2-project
+pmr update-cluster --name mycluster@my-ai2-project
 
 # Update specific instances only
-pmr update_cluster --name mycluster -i i-abc123 -i i-def456
+pmr update-cluster --name mycluster -i i-abc123 -i i-def456
 ```
 
 ### Instance Setup
@@ -384,7 +384,7 @@ pmr setup-decon --name mycluster --github-token ghp_xxx --detach
 
 ## How It Works
 
-1. **Cloud Backend**: The `--cloud` flag selects the backend module (AWS or GCP). Both expose the same interface (`InstanceInfo`, `BucketInfo`, etc.) so all commands work identically across clouds.
+1. **Cloud Backend**: The `--cloud` flag selects the backend module (AWS or GCP). Both expose the same interface (`InstanceInfo`, `BucketInfo`, etc.) so all commands work identically across clouds. Shared logic — `InstanceStatus` enum, display properties, bucket validation — lives in `base_instance.py`; each backend extends it with cloud-specific operations.
 
 2. **Instance Tagging**: Instances are tagged with `Project` (cluster name), `Contact` (owner), and `Tool` (`poormanray`). On GCP, labels are lowercase-sanitized to meet GCE requirements.
 
@@ -449,6 +449,34 @@ pmr create --name quickjob --number 1
 pmr run --name quickjob --command "./my-job.sh" --spindown
 # Instance auto-terminates after job completes
 ```
+
+## Development
+
+This project uses [uv](https://docs.astral.sh/uv/) for dependency management. Always use `uv run` to execute Python commands:
+
+```bash
+# Install dependencies (including GCP extras)
+uv sync --extra gcp
+
+# Run the CLI during development
+uv run pmr --help
+
+# Run Python one-liners
+uv run python -c "from poormanray.base_instance import InstanceStatus; print(InstanceStatus.active())"
+```
+
+### Architecture
+
+```
+base_instance.py          # InstanceStatus, InstanceInfoBase, BucketInfoBase
+  ├── aws_instance.py     # InstanceInfo, BucketInfo, ClientUtils (AWS/boto3)
+  └── gcp_instance.py     # InstanceInfo, BucketInfo, ClientUtils (GCP/google-cloud)
+
+cli.py                    # resolve_backend(cloud) → picks module at runtime
+ssh_session.py            # SSH via paramiko, cloud-aware
+```
+
+Both backends export the same class names. The CLI resolves the backend at runtime via `resolve_backend(cloud)`, so commands work identically across clouds.
 
 ## License
 
