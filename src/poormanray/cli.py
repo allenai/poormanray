@@ -206,6 +206,7 @@ def base_cli_options(f: T) -> T:
             help="Owner. Useful for cost tracking.",
         ),
         click.option(
+            "-C",
             "--cloud",
             type=click.Choice(["aws", "gcp"]),
             default="aws",
@@ -326,6 +327,7 @@ def common_cli_options(f: T) -> T:
             help="Username to use for SSH connections (default: ec2-user for AWS, owner for GCP)",
         ),
         click.option(
+            "-G",
             "--gcp-project",
             type=str,
             default=None,
@@ -340,24 +342,28 @@ def common_cli_options(f: T) -> T:
 
 @common_cli_options
 @click.option(
+    "-E",
     "--storage-type",
     type=str,
     default=None,
     help="Storage type to use for the instances (e.g. gp3 for AWS, pd-balanced for GCP)",
 )
 @click.option(
+    "-Z",
     "--storage-size",
     type=int,
     default=None,
     help="Storage size to use for the instances",
 )
 @click.option(
+    "-I",
     "--storage-iops",
     type=int,
     default=None,
     help="IOPS for the root volume (AWS only)",
 )
 @click.option(
+    "-z",
     "--zone",
     type=str,
     default=None,
@@ -531,6 +537,7 @@ def create_instances(
     help="Days before hard-delete lifecycle expiration.",
 )
 @click.option(
+    "-G",
     "--gcp-project",
     type=str,
     default=None,
@@ -613,6 +620,7 @@ def create_bucket(
     help="Days used when adding a missing hard-delete lifecycle rule.",
 )
 @click.option(
+    "-G",
     "--gcp-project",
     type=str,
     default=None,
@@ -686,6 +694,7 @@ def update_bucket(
 @base_cli_options
 @click.option("-y", "--yes", is_flag=True, default=False, help="Skip confirmation prompt.")
 @click.option(
+    "-G",
     "--gcp-project",
     type=str,
     default=None,
@@ -746,6 +755,7 @@ def delete_bucket(
     help="Instance ID to work on; can be used multiple times.",
 )
 @click.option(
+    "-G",
     "--gcp-project",
     type=str,
     default=None,
