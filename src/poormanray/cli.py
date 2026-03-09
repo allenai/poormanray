@@ -1931,10 +1931,10 @@ def version():
 
 
 cli.command(name="create")(create_instances)
-cli.command(name="create_bucket")(create_bucket)
+cli.command(name="create-bucket")(create_bucket)
 cli.command(name="list")(list_instances)
 cli.command(name="terminate")(terminate_instances)
-cli.command(name="update_cluster")(update_cluster)
+cli.command(name="update-cluster")(update_cluster)
 cli.command(name="run")(run_command)
 cli.command(name="setup")(setup_instances)
 cli.command(name="setup-d2tk")(setup_dolma2_toolkit)
@@ -1943,8 +1943,8 @@ cli.command(name="setup-decon")(setup_decon)
 cli.command(name="map")(map_commands)
 cli.command(name="pause")(pause_instances)
 cli.command(name="resume")(resume_instances)
-cli.command(name="update_bucket")(update_bucket)
-cli.command(name="delete_bucket")(delete_bucket)
+cli.command(name="update-bucket")(update_bucket)
+cli.command(name="delete-bucket")(delete_bucket)
 cli.command(name="wait")(wait_instances)
 cli.command(name="ssh")(ssh_instance)
 
