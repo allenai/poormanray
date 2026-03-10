@@ -331,6 +331,13 @@ class Session:
         if not (scripts or commands):
             raise RuntimeError("No scripts, commands, or extra lines provided")
 
+        # shortcut: if no scripts and all commands are one-liner, do no upload, but return command to
+        # run directly.
+        if not scripts and all("\n" not in cmd for cmd in (commands or [])):
+            command = "; ".join(commands or [])
+            logger.debug("No scripts, running commands directly: %s", command)
+            return ("", command)
+
         with tempfile.TemporaryDirectory() as _td:
             temp_dir = Path(_td)
             paths_to_upload: list[str] = []
