@@ -2,9 +2,7 @@
 Utility functions for poormanray.
 """
 
-import base64
 import configparser
-import hashlib
 import os
 import shlex
 import shutil
