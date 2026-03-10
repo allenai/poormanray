@@ -458,7 +458,11 @@ def create_instances(
         if cloud == "gcp"
         else None
     )
+
     if cloud == "gcp":
+        if gcp_metadata is None:
+            raise RuntimeError("GCP metadata not available")
+
         logger.info(f"Using labels: {gcp_metadata.labels}")
         if gcp_metadata.tags:
             logger.info(f"Using tags: {gcp_metadata.tags}")
@@ -507,6 +511,9 @@ def create_instances(
         logger.info(f"Creating instance {index + 1 - start_id} of {number} (index: {index})...")
 
         if cloud == "gcp":
+            if gcp_metadata is None:
+                raise RuntimeError("GCP metadata not available")
+
             instance = InstanceInfo.create_instance(
                 instance_type=instance_type,
                 region=region,

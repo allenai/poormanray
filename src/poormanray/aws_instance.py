@@ -383,7 +383,7 @@ class InstanceInfo(InstanceInfoBase):
                 *({"Name": f"tag:{key}", "Values": [value]} for key, value in tag_filters.items()),
             ]
             response_describe = client.describe_instances(  # pyright: ignore
-                **({"Filters": filters} if filters else {})
+                **({"Filters": filters} if filters else {})  # pyright: ignore
             )
             for reservation in response_describe.get("Reservations", []):
                 for instance in reservation.get("Instances", []):
