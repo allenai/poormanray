@@ -359,7 +359,7 @@ class Session:
                     script_name=script_path.name,
                 )
                 paths_to_upload.append(str(new_script_path))
-                wrapper_contents.append(f".${{SCRIPT_DIR}}/{new_script_path.name}")
+                wrapper_contents.append(f"${{SCRIPT_DIR}}/{new_script_path.name}")
 
             # separator between script paths and commands
             wrapper_contents.append("\n# # # # # # # # COMMANDS# # # # # # # #\n")
