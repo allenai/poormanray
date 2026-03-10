@@ -12,7 +12,7 @@ import tempfile
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Literal, TypeVar
+from typing import Any, TypeVar
 
 import paramiko
 from paramiko.channel import ChannelFile, ChannelStdinFile
@@ -74,7 +74,7 @@ class Session:
         private_key_path: str | None = None,
         user: str | None = None,
         client: Any = None,
-        cloud: Literal["aws", "gcp"] = "aws",
+        cloud: str = "aws",
         gcp_project: str | None = None,
         banner_timeout: int = 5,
         connect_jitter: float | None = None,
@@ -93,7 +93,7 @@ class Session:
                 instance_id=instance_id, region=(region or "us-central1"), gcp_project=gcp_project, client=client
             )
             self.InstanceStatus = GCPInstanceStatus
-        else:
+        elif cloud == "aws":
             from .aws_instance import InstanceInfo as AWSInstanceInfo
             from .aws_instance import InstanceStatus as AWSInstanceStatus
 
@@ -104,6 +104,8 @@ class Session:
                 instance_id=instance_id, region=(region or "us-east-1"), client=client
             )
             self.InstanceStatus = AWSInstanceStatus
+        else:
+            raise ValueError(f"Unsupported cloud: {cloud}; valid options are 'aws' and 'gcp'")
 
         self.private_key_path = private_key_path
         self.user = user
