@@ -1144,7 +1144,7 @@ def run_command(
     region: str | None,
     instance_id: list[str] | None,
     command: str | None,
-    script: str | None,
+    script: str | list[str] | None,
     ssh_key_path: str,
     detach: bool,
     spindown: bool,
@@ -1234,7 +1234,7 @@ def run_command(
 
         instance_commands = [command] if command else []
         instance_commands += [_spindown_command(cloud, instance.instance_id)] if spindown else []
-        instance_scripts = [script] if script else []
+        instance_scripts = [script] if isinstance(script, str) else (script or [])
         _, command_to_run = session.upload_scripts(scripts=instance_scripts, commands=instance_commands)
         output_ = session.run(command_to_run, detach=detach, timeout=timeout)
         return instance.instance_id, str(output_)
