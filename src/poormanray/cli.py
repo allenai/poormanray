@@ -18,11 +18,12 @@ import types
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import partial, reduce
-from typing import Any, Callable, TypeVar
+from typing import Callable, TypeVar
 
 import click
 
 from . import logger
+from .base_instance import InstanceInfoBase
 from .commands import (
     D2TK_SETUP,
     DOLMA_PYTHON_SETUP,
@@ -1667,7 +1668,7 @@ def map_command(
     logger.info(f"Found {len(instances):,} instances to map {len(script):,} scripts to!")
 
     # Determine script assignments per instance
-    assignments: list[tuple[Any, list[str]]] = []
+    assignments: list[tuple[InstanceInfoBase, list[str]]] = []
     for i, instance in enumerate(instances):
         ratio = len(script) / len(instances)
         start_idx = round(ratio * i)
@@ -1675,14 +1676,16 @@ def map_command(
         instance_scripts = script[start_idx:end_idx]
         assignments.append((instance, instance_scripts))
 
-    def upload_to_instance(assignment) -> tuple[Any, str | None]:
+    def upload_to_instance(
+        assignment: tuple[InstanceInfoBase, list[str]],
+    ) -> tuple[InstanceInfoBase, str | None]:
         inst, instance_scripts = assignment
         logger.info(
             f"Assigned {len(instance_scripts)} script{'s' if len(instance_scripts) > 1 else ''} "
             f"to instance {inst.instance_id}"
         )
         if not instance_scripts:
-            return inst.instance_id, None
+            return inst, None
 
         session = Session(
             instance_id=inst.instance_id,
@@ -1730,6 +1733,10 @@ def map_command(
 
     for idx in sorted(upload_results):
         inst, run_cmd = upload_results[idx]
+        if run_cmd is None:
+            logger.info(f"No scripts to run on instance {inst.instance_id}")
+            continue
+
         logger.info(f"Running scripts on instance {inst.instance_id}")
         runner_fn(
             instance_id=[inst.instance_id],
