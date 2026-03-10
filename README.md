@@ -183,7 +183,6 @@ pmr wait --name mycluster --timeout 300 --poll-interval 15
 #   --poll-interval     Seconds between status checks (default: 10)
 #   -T, --timeout       Timeout in seconds (default: wait indefinitely)
 #   -c, --command       Command that must exit 0 for instance to be considered ready
-#   -s, --script        Script that must exit 0 for instance to be considered ready
 ```
 
 #### `ssh` - Connect to an instance
@@ -375,6 +374,7 @@ pmr setup-decon --name mycluster --github-token ghp_xxx --detach
 | `--number` | `-N` | Number of instances to create (default: 1) |
 | `--image` | `-a` | Image ID: AMI for AWS, image family for GCP |
 | `--timeout` | `-T` | Timeout in seconds for command execution |
+| `--banner-timeout` | | SSH banner timeout in seconds (default: 15) |
 | `--spindown/--no-spindown` | `-S/-NS` | Self-terminate instance after command completes |
 | `--command` | `-c` | Command to execute on instances |
 | `--script` | `-s` | Path to script file or directory to execute |

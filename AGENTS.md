@@ -22,7 +22,7 @@ poormanray/
 │   ├── gcp_instance.py         # GCP backend: same exports as aws_instance (extends base)
 │   ├── ssh_session.py          # SSH session manager (paramiko), cloud-aware
 │   ├── commands.py             # Shell script constants for instance setup (D2TK, Dolma, DECON, etc.)
-│   ├── utils.py                # AWS credential utilities, script_to_command helper
+│   ├── utils.py                # AWS credential utilities
 │   └── logger.py               # Logging configuration
 ├── release-notes/              # Per-version release notes (e.g., 1.0.0.md)
 └── assets/                     # Logo and images
@@ -107,7 +107,8 @@ The CLI supports AWS and GCP via a backend module pattern:
 ### Remote Execution
 
 - Commands can run in detached mode using GNU screen
-- Scripts are base64-encoded for transfer to instances
+- Scripts are transferred to instances via SFTP and executed with a generated wrapper script
+- If all commands are one-liners (no scripts), they are run directly without uploading a script file
 - The `map` command distributes scripts across instances evenly
 - Spindown commands are cloud-specific: `aws ec2 terminate-instances` vs `gcloud compute instances delete`
 
