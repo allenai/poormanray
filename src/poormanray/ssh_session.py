@@ -342,7 +342,8 @@ class Session:
             temp_dir = Path(_td)
             paths_to_upload: list[str] = []
 
-            wrapper_contents = ["SCRIPT_DIR=$(dirname $0)"]
+            # extract path to folder; all scripts are relative to this path
+            wrapper_contents = ['SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"']
 
             wrapper_contents.append("\n# # # # # # # # SCRIPTS # # # # # # # #\n")
 
