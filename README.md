@@ -245,9 +245,8 @@ ls scripts/
 # Distribute and run across cluster
 pmr map --name mycluster --script scripts/
 
-# Scripts are shuffled, distributed evenly, and executed in detached screen sessions.
-# Each instance gets a run_all.sh that runs its assigned scripts sequentially,
-# with progress logged to run_all.log.
+# Scripts are shuffled, distributed evenly via SFTP, and executed in detached screen sessions.
+# Each instance gets a wrapper script that runs its assigned scripts sequentially.
 
 # Stop instances after their scripts complete
 pmr map --name mycluster --script scripts/ --spindown
@@ -392,7 +391,7 @@ pmr setup-decon --name mycluster --github-token ghp_xxx --detach
 
 4. **Remote Execution**: Commands are executed over SSH using paramiko. Long-running commands use GNU screen for detached execution.
 
-5. **Script Distribution**: The `map` command base64-encodes scripts, transfers them to instances, and executes them in parallel.
+5. **Script Distribution**: The `run` and `map` commands transfer scripts to instances via SFTP and execute them in parallel. Each instance receives a generated wrapper script that runs the uploaded files in order.
 
 6. **Credential Setup**: On AWS, `setup` pushes `~/.aws/credentials` to instances. On GCP, the default compute service account provides access — no credential push needed.
 
