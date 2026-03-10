@@ -615,18 +615,13 @@ def create_bucket(
     )
     logger.info(f"Creating bucket '{name}' in region {region} ({cloud})")
     logger.info(f"Using tags: {bucket_tags}")
-    if cloud == "gcp" and project:
-        logger.warning(
-            "GCP bucket ai2-project metadata still uses labels in the current storage client path; "
-            "resource-manager tags are only applied to instances."
-        )
 
     try:
         if cloud == "gcp":
             BucketInfo.create_bucket(
                 bucket_name=name,
                 location=region,
-                labels=bucket_tags,
+                tags=bucket_tags,
                 transition_days=tier_after_days,
                 expiration_days=expire_after_days,
                 gcp_project=gcp_project,
@@ -644,7 +639,8 @@ def create_bucket(
                 client=client,
             )
     except Exception as e:
-        raise click.ClickException(f"Failed to create bucket '{name}': {e}") from e
+        logger.exception(f"Bucket creation failed for '{name}' in region {region} ({cloud})")
+        raise click.ClickException(f"Failed to create bucket '{name}' ({type(e).__name__}): {e}") from e
 
     logger.info(f"Created bucket '{name}'")
 
@@ -701,17 +697,12 @@ def update_bucket(
         tool=__package__,
     )
     logger.info(f"Updating bucket '{name}' in region {region} ({cloud})")
-    if cloud == "gcp" and project:
-        logger.warning(
-            "GCP bucket ai2-project metadata still uses labels in the current storage client path; "
-            "resource-manager tags are only applied to instances."
-        )
 
     try:
         if cloud == "gcp":
             missing_tags, lifecycle_updated = BucketInfo.update_bucket(
                 bucket_name=name,
-                labels=bucket_tags,
+                tags=bucket_tags,
                 transition_days=tier_after_days,
                 expiration_days=expire_after_days,
                 gcp_project=gcp_project,
@@ -728,7 +719,8 @@ def update_bucket(
                 client=client,
             )
     except Exception as e:
-        raise click.ClickException(f"Failed to update bucket '{name}': {e}") from e
+        logger.exception(f"Bucket update failed for '{name}' in region {region} ({cloud})")
+        raise click.ClickException(f"Failed to update bucket '{name}' ({type(e).__name__}): {e}") from e
 
     if len(missing_tags) == 0:
         logger.info("No missing bucket tags detected")

@@ -5,6 +5,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import time
 from typing import Any, Optional
 
 from . import logger
@@ -42,6 +43,8 @@ _STATUS_TO_GCE: dict[InstanceStatus, list[str]] = {
 
 _CLOUD_RESOURCE_MANAGER_API = "https://cloudresourcemanager.googleapis.com/v3"
 _GCP_TAG_PARENT_ENV_VARS = ("PMR_GCP_AI2_PROJECT_TAG_PARENT", "PMR_GCP_TAG_NAMESPACE")
+_CLOUD_RESOURCE_MANAGER_OPERATION_TIMEOUT_SECONDS = 60.0
+_CLOUD_RESOURCE_MANAGER_OPERATION_POLL_INTERVAL_SECONDS = 1.0
 
 
 def _resolve_gcp_project(gcp_project: str | None) -> str:
@@ -80,9 +83,13 @@ def _cloud_resource_manager_get(
     *,
     params: dict[str, str] | None = None,
     acceptable_statuses: tuple[int, ...] = (),
+    location: str | None = None,
 ) -> dict[str, Any] | None:
+    base_url = _CLOUD_RESOURCE_MANAGER_API
+    if location:
+        base_url = f"https://{location.lower()}-cloudresourcemanager.googleapis.com/v3"
     response = _get_authorized_session().get(
-        f"{_CLOUD_RESOURCE_MANAGER_API}/{path.lstrip('/')}",
+        f"{base_url}/{path.lstrip('/')}",
         params=params,
         timeout=30,
     )
@@ -90,6 +97,55 @@ def _cloud_resource_manager_get(
         return None
     response.raise_for_status()
     return dict(response.json())
+
+
+def _cloud_resource_manager_post(
+    path: str,
+    *,
+    json: dict[str, Any],
+    acceptable_statuses: tuple[int, ...] = (),
+    location: str | None = None,
+) -> dict[str, Any] | None:
+    base_url = _CLOUD_RESOURCE_MANAGER_API
+    if location:
+        base_url = f"https://{location.lower()}-cloudresourcemanager.googleapis.com/v3"
+    response = _get_authorized_session().post(
+        f"{base_url}/{path.lstrip('/')}",
+        json=json,
+        timeout=30,
+    )
+    if response.status_code in acceptable_statuses:
+        return None
+    response.raise_for_status()
+    return dict(response.json())
+
+
+def _wait_for_cloud_resource_manager_operation(
+    operation_name: str,
+    *,
+    location: str | None = None,
+    timeout_seconds: float = _CLOUD_RESOURCE_MANAGER_OPERATION_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        operation = _cloud_resource_manager_get(operation_name, location=location)
+        assert operation is not None, f"Missing operation status for {operation_name}"
+        if operation.get("done"):
+            if error := operation.get("error"):
+                raise RuntimeError(f"Cloud Resource Manager operation failed: {error}")
+            return operation
+
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"Timed out after {timeout_seconds:.0f}s waiting for Cloud Resource Manager "
+                f"operation {operation_name}"
+            )
+
+        time.sleep(_CLOUD_RESOURCE_MANAGER_OPERATION_POLL_INTERVAL_SECONDS)
+
+
+def _bucket_resource_name(bucket_name: str) -> str:
+    return f"//storage.googleapis.com/projects/_/buckets/{bucket_name}"
 
 
 @functools.lru_cache(maxsize=None)
@@ -217,6 +273,134 @@ class ClientUtils:
 
 class BucketInfo(BucketInfoBase):
     @classmethod
+    def _normalize_bucket_metadata(
+        cls,
+        *,
+        labels: dict[str, str] | None = None,
+        tags: dict[str, str] | None = None,
+        gcp_project: str | None = None,
+    ) -> tuple[dict[str, str], dict[str, str]]:
+        requested_labels = dict(labels or {})
+        resource_manager_tags: dict[str, str] = {}
+
+        if tags:
+            for key, value in tags.items():
+                if not value:
+                    continue
+
+                if key == GCP_AI2_PROJECT_TAG_KEY:
+                    resource_manager_tags |= resolve_ai2_project_resource_manager_tags(
+                        str(value),
+                        gcp_project=gcp_project,
+                    )
+                    continue
+
+                requested_labels.setdefault(key, _sanitize_label_value(str(value)))
+
+        ai2_project_label_value = requested_labels.pop(GCP_AI2_PROJECT_TAG_KEY, None)
+        if ai2_project_label_value:
+            resource_manager_tags |= resolve_ai2_project_resource_manager_tags(
+                str(ai2_project_label_value),
+                gcp_project=gcp_project,
+            )
+
+        return requested_labels, resource_manager_tags
+
+    @classmethod
+    def _list_bucket_tag_bindings(
+        cls,
+        bucket_name: str,
+        *,
+        location: str,
+    ) -> list[dict[str, Any]]:
+        parent = _bucket_resource_name(bucket_name)
+        tag_bindings: list[dict[str, Any]] = []
+        page_token: str | None = None
+
+        while True:
+            params = {"parent": parent}
+            if page_token:
+                params["pageToken"] = page_token
+
+            response = _cloud_resource_manager_get(
+                "tagBindings",
+                params=params,
+                location=location,
+            )
+            if not response:
+                break
+
+            tag_bindings.extend(dict(binding) for binding in response.get("tagBindings", []))
+            page_token = response.get("nextPageToken")
+            if not page_token:
+                break
+
+        return tag_bindings
+
+    @classmethod
+    def _ensure_bucket_resource_manager_tags(
+        cls,
+        bucket_name: str,
+        *,
+        location: str,
+        resource_manager_tags: dict[str, str] | None = None,
+    ) -> dict[str, str]:
+        if not resource_manager_tags:
+            return {}
+
+        existing_tag_value_names = {
+            str(binding.get("tagValueNamespacedName", ""))
+            for binding in cls._list_bucket_tag_bindings(bucket_name, location=location)
+            if binding.get("tagValueNamespacedName")
+        }
+
+        missing_tags: dict[str, str] = {}
+        parent = _bucket_resource_name(bucket_name)
+        for tag_key, tag_value in resource_manager_tags.items():
+            tag_value_namespaced_name = f"{tag_key}/{tag_value}"
+            if tag_value_namespaced_name in existing_tag_value_names:
+                continue
+
+            logger.info(
+                "Attaching GCP resource-manager tag "
+                f"'{tag_value_namespaced_name}' to bucket '{bucket_name}' in location '{location}'"
+            )
+
+            operation = _cloud_resource_manager_post(
+                "tagBindings",
+                json={
+                    "parent": parent,
+                    "tagValueNamespacedName": tag_value_namespaced_name,
+                },
+                acceptable_statuses=(409,),
+                location=location,
+            )
+            if operation is None:
+                continue
+
+            if operation.get("done"):
+                if error := operation.get("error"):
+                    raise RuntimeError(
+                        "Cloud Resource Manager tag binding failed: "
+                        f"{error} for bucket '{bucket_name}' and tag '{tag_value_namespaced_name}'"
+                    )
+            else:
+                operation_name = operation.get("name")
+                if not operation_name:
+                    raise RuntimeError(
+                        "Cloud Resource Manager tag binding returned an unexpected response "
+                        f"without an operation name for bucket '{bucket_name}' and tag "
+                        f"'{tag_value_namespaced_name}': {operation!r}"
+                    )
+                _wait_for_cloud_resource_manager_operation(
+                    str(operation_name),
+                    location=location,
+                )
+            missing_tags[tag_key] = tag_value
+
+        return missing_tags
+
+    @classmethod
     def default_tags(
         cls,
         name: str,
@@ -252,15 +436,26 @@ class BucketInfo(BucketInfoBase):
         cls.validate_bucket_name(bucket_name)
         project = _resolve_gcp_project(gcp_project)
         client = client or storage.Client(project=project)
+        requested_labels, resource_manager_tags = cls._normalize_bucket_metadata(
+            labels=labels,
+            tags=tags,
+            gcp_project=project,
+        )
 
         bucket = client.bucket(bucket_name)
         bucket.iam_configuration.public_access_prevention = "enforced"
-        if labels:
-            bucket.labels = labels
+        if requested_labels:
+            bucket.labels = requested_labels
         bucket.add_lifecycle_delete_rule(age=expiration_days)
         bucket.add_lifecycle_set_storage_class_rule("NEARLINE", age=transition_days)
 
-        client.create_bucket(bucket, location=location)
+        created_bucket = client.create_bucket(bucket, location=location)
+        bucket_location = str(getattr(created_bucket, "location", "") or location)
+        cls._ensure_bucket_resource_manager_tags(
+            bucket_name,
+            location=bucket_location.lower(),
+            resource_manager_tags=resource_manager_tags,
+        )
 
     @classmethod
     def update_bucket(
@@ -277,11 +472,16 @@ class BucketInfo(BucketInfoBase):
     ) -> tuple[dict[str, str], bool]:
         project = _resolve_gcp_project(gcp_project)
         client = client or storage.Client(project=project)
+        requested_labels, resource_manager_tags = cls._normalize_bucket_metadata(
+            labels=labels,
+            tags=tags,
+            gcp_project=project,
+        )
 
         bucket = client.get_bucket(bucket_name)
+        bucket_location = str(getattr(bucket, "location", "") or "us-central1")
 
         existing_labels = dict(bucket.labels or {})
-        requested_labels = labels or {}
         missing_labels = {k: v for k, v in requested_labels.items() if k not in existing_labels}
         if missing_labels:
             bucket.labels = {**existing_labels, **missing_labels}
@@ -301,7 +501,13 @@ class BucketInfo(BucketInfoBase):
         if lifecycle_updated:
             bucket.patch()
 
-        return missing_labels, lifecycle_updated
+        missing_resource_manager_tags = cls._ensure_bucket_resource_manager_tags(
+            bucket_name,
+            location=bucket_location.lower(),
+            resource_manager_tags=resource_manager_tags,
+        )
+
+        return missing_labels | display_gcp_resource_manager_tags(missing_resource_manager_tags), lifecycle_updated
 
     @classmethod
     def delete_bucket(
