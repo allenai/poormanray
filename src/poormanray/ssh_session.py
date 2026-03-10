@@ -176,7 +176,7 @@ class Session:
             channel = self.shell(client)
 
             # Create a new screen session
-            screen_name = f"olmo-cookbook-{command_hash}-{time.time()}"
+            screen_name = f"{__package__}-{command_hash}-{time.time()}"
             channel.send(f"screen -S {screen_name}\n".encode("utf-8"))
             time.sleep(0.1)  # Wait for screen to initialize
 
@@ -342,7 +342,9 @@ class Session:
             temp_dir = Path(_td)
             paths_to_upload: list[str] = []
 
-            wrapper_contents = ["SCRIPT_DIR=$(dirname $0)\n"]
+            wrapper_contents = ["SCRIPT_DIR=$(dirname $0)"]
+
+            wrapper_contents.append("\n# # # # # # # # SCRIPTS # # # # # # # #\n")
 
             # copy files over, make them executable
             for script_ in scripts or []:
@@ -356,7 +358,10 @@ class Session:
                     script_name=script_path.name,
                 )
                 paths_to_upload.append(str(new_script_path))
-                wrapper_contents.append(f"./${{SCRIPT_DIR}}/{new_script_path.name}\n")
+                wrapper_contents.append(f".${{SCRIPT_DIR}}/{new_script_path.name}")
+
+            # separator between script paths and commands
+            wrapper_contents.append("\n# # # # # # # # COMMANDS# # # # # # # #\n")
 
             # add command after the script paths
             for c in commands or []:
@@ -365,7 +370,7 @@ class Session:
             # now write the wrapper file
             wrapper_path = self._prepare_file(
                 temp_dir=temp_dir,
-                contents="\n\n\n".join(wrapper_contents),
+                contents="\n".join(wrapper_contents),
                 script_name="run.sh",
             )
             paths_to_upload.append(str(wrapper_path))
