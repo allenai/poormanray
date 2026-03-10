@@ -3,9 +3,12 @@ import hashlib
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Union
 
 import paramiko
@@ -209,6 +212,128 @@ class Session:
             return self.run_in_screen(command, detach=detach, terminate=terminate, timeout=(timeout or 600))
         else:
             return self.run_single(command, get_pty=get_pty, timeout=timeout)
+
+    def upload_files(
+        self,
+        local_paths: list[str],
+        remote_dir: str | None = None,
+    ) -> tuple[str, list[str]]:
+        """Upload local files to the remote instance via SFTP.
+
+        Args:
+            local_paths: Local file paths to upload.
+            remote_dir: Remote destination directory. If None, creates a temp
+                directory on the remote machine using mktemp.
+
+        Returns:
+            Tuple of (remote_dir, list of remote file paths).
+        """
+        if self.instance.state != self.InstanceStatus.RUNNING:
+            raise ValueError(f"Instance {self.instance.instance_id} is not running")
+
+        client = self.connect()
+        try:
+            if remote_dir is None:
+                _, stdout, stderr = client.exec_command("mktemp -d")
+                remote_dir = stdout.read().decode("utf-8").strip()
+                if not remote_dir:
+                    err = stderr.read().decode("utf-8").strip()
+                    raise RuntimeError(f"Failed to create remote temp directory: {err}")
+            else:
+                _, stdout, _ = client.exec_command(f"mkdir -p {remote_dir}")
+                stdout.channel.recv_exit_status()
+
+            sftp = client.open_sftp()
+            remote_paths = []
+            for local_path in local_paths:
+                filename = os.path.basename(local_path)
+                remote_path = f"{remote_dir}/{filename}"
+                sftp.put(local_path, remote_path)
+                sftp.chmod(remote_path, 0o755)
+                remote_paths.append(remote_path)
+            sftp.close()
+        finally:
+            client.close()
+
+        return remote_dir, remote_paths
+
+    def _prepare_file(self, temp_dir: Path, contents: str, script_name: str) -> Path:
+        script_path = Path(script_name)
+        script_md5 = hashlib.md5(script_bytes := contents.encode("utf-8")).hexdigest()[:8]
+        script_base = script_path.name.removesuffix((script_ext := "".join(script_path.suffixes)))
+        new_script_path = temp_dir / f"{script_base}_{script_md5[:8]}{script_ext}"
+
+        with open(new_script_path, "wb") as f:
+            f.write(script_bytes)
+
+        # preserve existing permissions and make executable
+        os.chmod(new_script_path, os.stat(new_script_path).st_mode | stat.S_IEXEC)
+
+        return new_script_path
+
+    def upload_scripts(
+        self,
+        scripts: list[str] | None = None,
+        commands: list[str] | None = None,
+    ) -> tuple[str, str]:
+        """Upload script files via SFTP and generate a wrapper to run them.
+
+        Creates a wrapper script (run.sh) that executes each uploaded script
+        in order, followed by any extra lines. All files are uploaded to a
+        temporary directory on the remote machine.
+
+        Args:
+            scripts: Local script file paths to upload and execute.
+            commands: Shell commands to execute after the scripts.
+
+        Returns:
+            Tuple of (remote_dir, shell command to execute the wrapper).
+        """
+        if not (scripts or commands):
+            raise RuntimeError("No scripts, commands, or extra lines provided")
+
+        with tempfile.TemporaryDirectory() as _td:
+            temp_dir = Path(_td)
+            paths_to_upload: list[str] = []
+
+            wrapper_contents = [
+                # default shell
+                "#!/usr/bin/env sh",
+                # get location of scripts
+                'script_dir="$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd)"',
+                # cd to script dir
+                "cd ${script_dir}",
+            ]
+
+            # copy files over, make them executable
+            for script_ in scripts or []:
+                if not (script_path := Path(script_)).is_file():
+                    raise ValueError(f"Script {script_path} does not exist")
+
+                # copy file to temp direcory, make executable, etc
+                new_script_path = self._prepare_file(
+                    temp_dir=temp_dir,
+                    contents=script_path.read_text(encoding="utf-8"),
+                    script_name=script_path.name,
+                )
+                paths_to_upload.append(str(new_script_path))
+                wrapper_contents.append(f"./{new_script_path.name}")
+
+            # add command after the script paths
+            for c in commands or []:
+                wrapper_contents.append(c)
+
+            # now write the wrapper file
+            wrapper_path = self._prepare_file(
+                temp_dir=temp_dir,
+                contents="\n\n\n".join(wrapper_contents),
+                script_name="run.sh",
+            )
+            paths_to_upload.append(str(wrapper_path))
+
+            remote_dir, _ = self.upload_files(paths_to_upload)
+
+        return remote_dir, f"cd {remote_dir} && bash {wrapper_path.name}"
 
 
 def import_ssh_key_to_ec2(key_name: str, region: str, private_key_path: str) -> str:

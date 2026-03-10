@@ -10,8 +10,6 @@ Email: luca@soldaini.net
 """
 
 import base64
-import json
-import logging
 import os
 import random
 import re
@@ -20,7 +18,7 @@ import types
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import partial, reduce
-from typing import Callable, TypeVar
+from typing import Any, Callable, TypeVar
 
 import click
 
@@ -33,15 +31,16 @@ from .commands import (
 )
 from .utils import script_to_command
 
-
-@click.group()
-def cli():
-    pass
-
+WAIT_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
 T = TypeVar("T", bound=Callable)
 S = TypeVar("S")
 R = TypeVar("R")
+
+
+@click.group()
+def cli():
+    pass
 
 
 def resolve_backend(cloud: str) -> types.ModuleType:
@@ -140,6 +139,27 @@ def run_in_parallel(
                 errors[index] = e
 
     return results, errors
+
+
+def _spindown_command(cloud: str, instance_id: str, terminate: bool = True) -> str:
+    """Generate a cloud-specific self-spindown command for an instance.
+
+    Args:
+        cloud: Cloud provider (aws or gcp).
+        instance_id: Instance ID for AWS commands.
+        terminate: If True, terminate/delete the instance. If False, just stop it.
+    """
+    if cloud == "gcp":
+        action = "delete" if terminate else "stop"
+        return (
+            "ZONE=$(curl -s -H 'Metadata-Flavor: Google' "
+            "http://metadata.google.internal/computeMetadata/v1/instance/zone "
+            "| rev | cut -d/ -f1 | rev) && "
+            f"gcloud compute instances {action} $(hostname) --zone=$ZONE --quiet"
+        )
+    else:
+        action = "terminate-instances" if terminate else "stop-instances"
+        return f"aws ec2 {action} --instance-ids {instance_id}"
 
 
 def _parse_project_name(ctx: click.Context, param: click.Parameter, value: str | None) -> str | None:
@@ -255,9 +275,8 @@ def common_cli_options(f: T) -> T:
                     os.path.abspath(file_path)
                     for root, _, files in os.walk(value)
                     for file_name in files
-                    if os.path.isfile(file_path := os.path.join(root, file_name)) and os.access(file_path, os.X_OK)
+                    if os.path.isfile(file_path := os.path.join(root, file_name))
                 ]
-                assert len(scripts) > 0, "No executable scripts found in the given directory"
                 return scripts
             raise click.UsageError(f"Script file or directory not found: {value}")
         elif param.name == "command" and value is not None:
@@ -1195,32 +1214,13 @@ def run_command(
         non_running_ids = ", ".join(instance.instance_id for instance in non_running_instances)
         raise ValueError(f"Instances are not running: {non_running_ids}")
 
-    base_command_to_run = script_to_command(script, to_file=True) if script is not None else command
-    assert base_command_to_run is not None, "command and script cannot both be None"
-
     max_workers = len(instances) if parallelism is None else min(parallelism, len(instances))
     logger.info(f"Running command on {len(instances)} instances with max parallelism={max_workers}")
-
-    def _spindown_command(instance_id_val: str) -> str:
-        if cloud == "gcp":
-            return (
-                "ZONE=$(curl -s -H 'Metadata-Flavor: Google' "
-                "http://metadata.google.internal/computeMetadata/v1/instance/zone "
-                "| rev | cut -d/ -f1 | rev) && "
-                "gcloud compute instances delete $(hostname) --zone=$ZONE --quiet"
-            )
-        else:
-            return f"aws ec2 terminate-instances --instance-ids {instance_id_val}"
 
     def run_on_instance(instance) -> tuple[str, str]:
         from .ssh_session import Session
 
         logger.info(f"Running command on instance {instance.instance_id} ({instance.name})")
-
-        command_to_run = base_command_to_run
-
-        if spindown:
-            command_to_run = f"{command_to_run}; {_spindown_command(instance.instance_id)}"
 
         session = Session(
             instance_id=instance.instance_id,
@@ -1230,6 +1230,11 @@ def run_command(
             cloud=cloud,
             gcp_project=gcp_project,
         )
+
+        instance_commands = [command] if command else []
+        instance_commands += [_spindown_command(cloud, instance.instance_id)] if spindown else []
+        instance_scripts = [script] if script else []
+        _, command_to_run = session.upload_scripts(scripts=instance_scripts, commands=instance_commands)
         output_ = session.run(command_to_run, detach=detach, timeout=timeout)
         return instance.instance_id, str(output_)
 
@@ -1599,7 +1604,7 @@ def setup_decon(
 
 
 @common_cli_options
-def map_commands(
+def map_command(
     name: str,
     region: str | None,
     instance_id: list[str] | None,
@@ -1630,6 +1635,8 @@ def map_commands(
         owner: Owner value.
         **kwargs: Additional CLI options injected by shared decorators; ignored here.
     """
+    from .ssh_session import Session
+
     region = resolve_region(region, cloud)
     backend = resolve_backend(cloud)
     InstanceInfo = backend.InstanceInfo
@@ -1639,7 +1646,7 @@ def map_commands(
     assert isinstance(script, list) and len(script) > 0, "script must be a list with at least one script"
 
     job_uuid = str(uuid.uuid4())
-    logging.info(f"Starting job with UUID: {job_uuid}")
+    logger.info(f"Starting job with UUID: {job_uuid}")
 
     script = script[:]
     random.shuffle(script)
@@ -1659,49 +1666,57 @@ def map_commands(
 
     logger.info(f"Found {len(instances):,} instances to map {len(script):,} scripts to!")
 
-    transfer_scripts_commands: list[list[str]] = []
-
+    # Determine script assignments per instance
+    assignments: list[tuple[Any, list[str]]] = []
     for i, instance in enumerate(instances):
         ratio = len(script) / len(instances)
         start_idx = round(ratio * i)
         end_idx = round(ratio * (i + 1))
         instance_scripts = script[start_idx:end_idx]
+        assignments.append((instance, instance_scripts))
 
-        transfer_scripts_commands.append([])
+    def upload_to_instance(assignment) -> tuple[Any, str | None]:
+        inst, instance_scripts = assignment
+        logger.info(
+            f"Assigned {len(instance_scripts)} script{'s' if len(instance_scripts) > 1 else ''} "
+            f"to instance {inst.instance_id}"
+        )
+        if not instance_scripts:
+            return inst.instance_id, None
 
-        transfer_scripts_commands[-1].append(f"mkdir -p {job_uuid}")
-        transfer_scripts_commands[-1].append(f"echo '#!/usr/bin/env bash' >> {job_uuid}/run_all.sh")
-        transfer_scripts_commands[-1].append(f"echo 'set -x' >> {job_uuid}/run_all.sh")
-        transfer_scripts_commands[-1].append(f"chmod +x {job_uuid}/run_all.sh")
+        session = Session(
+            instance_id=inst.instance_id,
+            region=region,
+            private_key_path=ssh_key_path,
+            user=instance_username,
+            cloud=cloud,
+            gcp_project=gcp_project,
+        )
 
-        for one_script in instance_scripts:
-            with open(one_script, "rb") as f:
-                base64_encoded_script = base64.b64encode(f.read()).decode("utf-8")
+        extra = [_spindown_command(cloud, inst.instance_id, terminate=False)] if spindown else None
+        remote_dir, run_cmd = session.upload_scripts(scripts=instance_scripts, commands=extra)
+        logger.info(
+            f"Uploaded script{'s' if len(instance_scripts) > 1 else ''} to {remote_dir} "
+            f"on instance {inst.instance_id}"
+        )
+        return inst, run_cmd
 
-            filename = os.path.basename(one_script)
+    upload_results, upload_errors = run_in_parallel(
+        assignments,
+        upload_to_instance,
+        action_name="script upload",
+    )
 
-            cmds = [
-                f"echo {base64_encoded_script} | base64 -d > {job_uuid}/{filename}",
-                f"chmod +x {job_uuid}/{filename}",
-                f'echo "$(date) - {job_uuid}/{filename} - START" >> {job_uuid}/run_all.log',
-                f"echo './{job_uuid}/{filename}' >> {job_uuid}/run_all.sh",
-                f'echo "$(date) - {job_uuid}/{filename} - DONE" >> {job_uuid}/run_all.log',
-            ]
+    if upload_errors:
+        for idx, err in sorted(upload_errors.items()):
+            inst = assignments[idx][0]
+            logger.error(f"Failed to upload scripts to {inst.instance_id}: {err}")
+        failed_ids = ", ".join(assignments[idx][0].instance_id for idx in sorted(upload_errors))
+        raise click.ClickException(f"Script upload failed for {len(upload_errors)} instance(s): {failed_ids}")
 
-            transfer_scripts_commands[-1].extend(cmds)
+    logger.info(f"Scripts uploaded to {len(upload_results):,} instances.")
 
-        if spindown:
-            if cloud == "gcp":
-                stop_command = (
-                    "ZONE=$(curl -s -H 'Metadata-Flavor: Google' "
-                    "http://metadata.google.internal/computeMetadata/v1/instance/zone "
-                    "| rev | cut -d/ -f1 | rev) && "
-                    "gcloud compute instances stop $(hostname) --zone=$ZONE --quiet"
-                )
-            else:
-                stop_command = f"aws ec2 stop-instances --instance-ids {instance.instance_id}"
-            transfer_scripts_commands[-1].append(f"echo '{stop_command}'>> {job_uuid}/run_all.sh")
-
+    # Run scripts on each instance in detached screen
     runner_fn = partial(
         run_command,
         name=name,
@@ -1713,32 +1728,18 @@ def map_commands(
         gcp_project=gcp_project,
     )
 
-    for instance, setup_commands in zip(instances, transfer_scripts_commands):
-        curr_instance_id = instance.instance_id
-        logger.info(f"Copying scripts to instance {curr_instance_id}")
+    for idx in sorted(upload_results):
+        inst, run_cmd = upload_results[idx]
+        logger.info(f"Running scripts on instance {inst.instance_id}")
         runner_fn(
-            instance_id=[curr_instance_id],
-            command="; ".join(setup_commands),
-            detach=False,
-            screen=False,
-            instance_username=instance_username,
-        )
-    logger.info(f"Scripts transferred on {len(instances):,} instances.")
-
-    for i, instance in enumerate(instances):
-        curr_instance_id = instance.instance_id
-        logger.info(f"Running {job_uuid}/run_all.sh on instance {curr_instance_id}")
-        runner_fn(
-            instance_id=[curr_instance_id],
-            command=f"bash {job_uuid}/run_all.sh",
+            instance_id=[inst.instance_id],
+            command=run_cmd,
             detach=True,
             screen=True,
             instance_username=instance_username,
         )
-    logger.info(f"Job {job_uuid} started on {len(instances):,} instances.")
 
-
-WAIT_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    logger.info(f"Job {job_uuid} started on {len(upload_results):,} instances.")
 
 
 @common_cli_options
@@ -1981,7 +1982,7 @@ cli.command(name="setup")(setup_instances)
 cli.command(name="setup-d2tk")(setup_dolma2_toolkit)
 cli.command(name="setup-dolma-python")(setup_dolma_python)
 cli.command(name="setup-decon")(setup_decon)
-cli.command(name="map")(map_commands)
+cli.command(name="map")(map_command)
 cli.command(name="pause")(pause_instances)
 cli.command(name="resume")(resume_instances)
 cli.command(name="update-bucket")(update_bucket)
