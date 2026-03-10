@@ -30,7 +30,6 @@ from .commands import (
     PACKAGE_MANAGER_DETECTOR,
     make_decon_python_setup,
 )
-from .utils import script_to_command
 
 WAIT_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
@@ -295,6 +294,12 @@ def common_cli_options(f: T) -> T:
         ),
         click.option("-N", "--number", type=int, default=1, help="Number of instances"),
         click.option("-T", "--timeout", type=int, default=None, help="Timeout for the command"),
+        click.option(
+            "--banner-timeout",
+            type=int,
+            default=15,
+            help="SSH banner timeout in seconds (default: 15)",
+        ),
         click.option(
             "-S/-NS",
             "--spindown/--no-spindown",
@@ -1153,6 +1158,7 @@ def run_command(
     gcp_project: str | None,
     parallelism: int | None = None,
     timeout: int | None = None,
+    banner_timeout: int = 5,
     owner: str | None = None,
     **kwargs,
 ):
@@ -1175,6 +1181,7 @@ def run_command(
         gcp_project: GCP project ID.
         parallelism: Maximum number of concurrent remote executions.
         timeout: Optional per-instance command timeout in seconds.
+        banner_timeout: SSH banner timeout in seconds.
         owner: Owner value.
         **kwargs: Additional CLI options injected by shared decorators; ignored here.
     """
@@ -1230,6 +1237,7 @@ def run_command(
             user=instance_username,
             cloud=cloud,
             gcp_project=gcp_project,
+            banner_timeout=banner_timeout,
         )
 
         instance_commands = [command] if command else []
@@ -1277,6 +1285,8 @@ def setup_instances(
     instance_username: str | None,
     cloud: str,
     gcp_project: str | None,
+    banner_timeout: int = 5,
+    parallelism: int | None = None,
     **kwargs,
 ):
     """
@@ -1301,17 +1311,8 @@ def setup_instances(
     region = resolve_region(region, cloud)
     instance_username = resolve_instance_username(instance_username, cloud, owner)
 
-    screen_install = f"{PACKAGE_MANAGER_DETECTOR} sudo ${{PKG_MANAGER}} install -y screen"
-    screen_install_base64 = base64.b64encode(screen_install.encode("utf-8")).decode("utf-8")
-
-    if cloud == "gcp":
-        logger.info(f"Setting up screen on GCP instances with project={name}, owner={owner} in region {region}")
-        setup_command = [
-            f"echo '{screen_install_base64}' | base64 -d > screen_setup.sh",
-            "chmod +x screen_setup.sh",
-            "./screen_setup.sh",
-        ]
-    else:
+    setup_command = f"{PACKAGE_MANAGER_DETECTOR.strip()}\nsudo ${{PKG_MANAGER}} install -y screen\n"
+    if cloud == "aws":
         from .utils import get_aws_access_key_id, get_aws_secret_access_key, make_aws_config, make_aws_credentials
 
         logger.info(
@@ -1335,14 +1336,14 @@ def setup_instances(
         aws_config_base64 = base64.b64encode(aws_config.encode("utf-8")).decode("utf-8")
         aws_credentials_base64 = base64.b64encode(aws_credentials.encode("utf-8")).decode("utf-8")
 
-        setup_command = [
-            "mkdir -p ~/.aws",
-            f"echo '{aws_config_base64}' | base64 -d > ~/.aws/config",
-            f"echo '{aws_credentials_base64}' | base64 -d > ~/.aws/credentials",
-            f"echo '{screen_install_base64}' | base64 -d > screen_setup.sh",
-            "chmod +x screen_setup.sh",
-            "./screen_setup.sh",
-        ]
+        setup_command += "\n\n".join(
+            [
+                "mkdir -p ${HOME}/.aws",
+                f"echo '{aws_config_base64}' | base64 -d > ${{HOME}}/.aws/config",
+                f"echo '{aws_credentials_base64}' | base64 -d > ${{HOME}}/.aws/credentials",
+                "",
+            ]
+        )
 
     logger.info("Running setup command on instances")
     run_command(
@@ -1350,7 +1351,7 @@ def setup_instances(
         region=region,
         owner=owner,
         instance_id=instance_id,
-        command=" && ".join(setup_command),
+        command=setup_command,
         script=None,
         ssh_key_path=ssh_key_path,
         detach=False,
@@ -1358,7 +1359,9 @@ def setup_instances(
         screen=True,
         instance_username=instance_username,
         cloud=cloud,
+        parallelism=parallelism,
         gcp_project=gcp_project,
+        banner_timeout=banner_timeout,
     )
     logger.info("Setup completed")
 
@@ -1374,6 +1377,8 @@ def setup_dolma2_toolkit(
     instance_username: str | None,
     cloud: str,
     gcp_project: str | None,
+    banner_timeout: int = 5,
+    parallelism: int | None = None,
     **kwargs,
 ):
     """
@@ -1405,15 +1410,9 @@ def setup_dolma2_toolkit(
         instance_username=instance_username,
         detach=False,
         cloud=cloud,
+        parallelism=parallelism,
         gcp_project=gcp_project,
     )
-
-    base64_encoded_setup_command = base64.b64encode(D2TK_SETUP.encode("utf-8")).decode("utf-8")
-    command = [
-        f"echo '{base64_encoded_setup_command}' | base64 -d > setup.sh",
-        "chmod +x setup.sh",
-        "./setup.sh",
-    ]
 
     logger.info(f"Setting up Dolma2 toolkit on instances with project={name}, owner={owner}")
     run_command(
@@ -1421,7 +1420,7 @@ def setup_dolma2_toolkit(
         region=region,
         owner=owner,
         instance_id=instance_id,
-        command=" && ".join(command),
+        command=D2TK_SETUP.strip(),
         script=None,
         ssh_key_path=ssh_key_path,
         detach=detach,
@@ -1429,7 +1428,9 @@ def setup_dolma2_toolkit(
         screen=True,
         instance_username=instance_username,
         cloud=cloud,
+        parallelism=parallelism,
         gcp_project=gcp_project,
+        banner_timeout=banner_timeout,
     )
     logger.info("Dolma2 toolkit setup completed")
 
@@ -1445,6 +1446,8 @@ def setup_dolma_python(
     instance_username: str | None,
     cloud: str,
     gcp_project: str | None,
+    banner_timeout: int = 5,
+    parallelism: int | None = None,
     **kwargs,
 ):
     """
@@ -1476,15 +1479,9 @@ def setup_dolma_python(
         instance_username=instance_username,
         detach=False,
         cloud=cloud,
+        parallelism=parallelism,
         gcp_project=gcp_project,
     )
-
-    base64_encoded_setup_command = base64.b64encode(DOLMA_PYTHON_SETUP.encode("utf-8")).decode("utf-8")
-    command = [
-        f"echo '{base64_encoded_setup_command}' | base64 -d > setup.sh",
-        "chmod +x setup.sh",
-        "./setup.sh",
-    ]
 
     logger.info(f"Setting up Dolma Python on instances with project={name}, owner={owner}")
     run_command(
@@ -1492,8 +1489,9 @@ def setup_dolma_python(
         region=region,
         owner=owner,
         instance_id=instance_id,
-        command=" && ".join(command),
+        command=DOLMA_PYTHON_SETUP.strip(),
         script=None,
+        parallelism=parallelism,
         ssh_key_path=ssh_key_path,
         detach=detach,
         spindown=False,
@@ -1501,6 +1499,7 @@ def setup_dolma_python(
         instance_username=instance_username,
         cloud=cloud,
         gcp_project=gcp_project,
+        banner_timeout=banner_timeout,
     )
     logger.info("Dolma Python setup completed")
 
@@ -1524,6 +1523,8 @@ def setup_decon(
     instance_username: str | None,
     cloud: str,
     gcp_project: str | None,
+    banner_timeout: int = 5,
+    parallelism: int | None = None,
     **kwargs,
 ):
     """
@@ -1553,6 +1554,7 @@ def setup_decon(
         name=name,
         region=region,
         owner=owner,
+        parallelism=parallelism,
         instance_id=instance_id,
         ssh_key_path=ssh_key_path,
         instance_username=instance_username,
@@ -1578,27 +1580,23 @@ def setup_decon(
         )
 
         decon_setup_script = make_decon_python_setup(github_token, host_index=idx, host_count=len(instances))
-        base64_encoded_setup_command = base64.b64encode(decon_setup_script.encode("utf-8")).decode("utf-8")
-        command = [
-            f"echo '{base64_encoded_setup_command}' | base64 -d > setup.sh",
-            "chmod +x setup.sh",
-            "./setup.sh",
-        ]
 
         run_command(
             name=name,
             region=region,
             owner=owner,
             instance_id=[instance.instance_id],
-            command=" && ".join(command),
+            command=decon_setup_script,
             script=None,
             ssh_key_path=ssh_key_path,
             detach=detach,
+            parallelism=parallelism,
             spindown=False,
             screen=True,
             instance_username=instance_username,
             cloud=cloud,
             gcp_project=gcp_project,
+            banner_timeout=banner_timeout,
         )
 
     logger.info("Decon setup completed on all instances")
@@ -1615,6 +1613,7 @@ def map_command(
     instance_username: str | None,
     cloud: str,
     gcp_project: str | None,
+    banner_timeout: int = 5,
     owner: str | None = None,
     **kwargs,
 ):
@@ -1694,6 +1693,7 @@ def map_command(
             user=instance_username,
             cloud=cloud,
             gcp_project=gcp_project,
+            banner_timeout=banner_timeout,
         )
 
         extra = [_spindown_command(cloud, inst.instance_id, terminate=False)] if spindown else None
@@ -1768,6 +1768,7 @@ def wait_instances(
     poll_interval: int,
     cloud: str,
     gcp_project: str | None,
+    banner_timeout: int = 5,
     owner: str | None = None,
     **kwargs,
 ):
@@ -1801,7 +1802,7 @@ def wait_instances(
 
     ready_command: str | None = None
     if script is not None:
-        ready_command = script_to_command(script, to_file=True)
+        raise NotImplementedError("Script-based readiness is not supported")
     elif command is not None:
         ready_command = command
 
@@ -1845,7 +1846,9 @@ def wait_instances(
                         user=instance_username,
                         cloud=cloud,
                         gcp_project=gcp_project,
+                        banner_timeout=banner_timeout,
                     )
+                    # breakpoint()
                     check = session.run_single(
                         f"{ready_command} && echo __READY__ || echo __NOT_READY__", timeout=30
                     )

@@ -1,6 +1,7 @@
 import dataclasses as dt
 import hashlib
 import os
+import random
 import re
 import shutil
 import stat
@@ -67,6 +68,9 @@ class Session:
         client: Union["EC2Client", None] = None,
         cloud: str = "aws",
         gcp_project: str | None = None,
+        banner_timeout: int = 5,
+        connect_jitter: float = 3.0,
+        connect_retries: int = 5,
     ):
         if cloud == "gcp":
             from .gcp_instance import InstanceInfo as GCPInstanceInfo
@@ -87,6 +91,9 @@ class Session:
 
         self.private_key_path = private_key_path
         self.user = user
+        self.banner_timeout = banner_timeout
+        self.connect_jitter = connect_jitter
+        self.connect_retries = connect_retries
 
     def make_ssh_client(self) -> paramiko.SSHClient:
         client = paramiko.SSHClient()
@@ -94,13 +101,35 @@ class Session:
         return client
 
     def connect(self) -> paramiko.SSHClient:
-        client = self.make_ssh_client()
-        if self.private_key_path:
-            client.connect(self.instance.public_ip_address, username=self.user, key_filename=self.private_key_path)
-        else:
-            client.connect(self.instance.public_ip_address, username=self.user)
+        host = self.instance.public_ip_address
 
-        return client
+        for attempt in range(1, self.connect_retries + 1):
+            delay = random.uniform(0, self.connect_jitter)
+            logger.debug(
+                f"[{host}] Connection attempt {attempt}/{self.connect_retries}, waiting {delay:.1f}s before connecting..."
+            )
+            time.sleep(delay)
+            client = self.make_ssh_client()
+            try:
+                logger.debug(f"[{host}] Connecting (banner_timeout={self.banner_timeout}s)...")
+                client.connect(
+                    hostname=self.instance.public_ip_address,
+                    username=self.user,
+                    banner_timeout=float(self.banner_timeout),
+                    key_filename=self.private_key_path if self.private_key_path else None,
+                )
+                logger.debug(f"[{host}] Connected successfully on attempt {attempt}/{self.connect_retries}")
+                return client
+            except Exception as e:
+                client.close()
+                if attempt == self.connect_retries:
+                    logger.error(
+                        f"[{host}] All {self.connect_retries} connection attempts failed, last error: {e}"
+                    )
+                    raise
+                logger.warning(f"[{host}] Connection failed (attempt {attempt}/{self.connect_retries}): {e}")
+
+        raise RuntimeError("Unreachable")
 
     def shell(self, client: paramiko.SSHClient) -> paramiko.Channel:
         # Get local terminal size
@@ -115,10 +144,13 @@ class Session:
         return channel
 
     def run_single(self, command: str, timeout: int | None = None, get_pty: bool = False) -> SessionContent:
-        # run without screens
+        host = self.instance.public_ip_address
+        logger.debug(f"[{host}] Running command via exec_command...")
         client = self.connect()
         response = client.exec_command(command, timeout=timeout, get_pty=get_pty)
-        return SessionContent.from_command(*response)
+        result = SessionContent.from_command(*response)
+        logger.debug(f"[{host}] Command completed")
+        return result
 
     def run_in_screen(
         self,
@@ -127,6 +159,8 @@ class Session:
         timeout: int | None = None,
         terminate: bool = True,
     ) -> SessionContent:
+        host = self.instance.public_ip_address
+        logger.debug(f"[{host}] Checking if screen is installed...")
         # run a simple command to check if screen is installed
         if "screen" not in self.run_single("which screen").stdout:
             raise RuntimeError("screen is not installed; cannot run in screen")
@@ -135,9 +169,9 @@ class Session:
         command_hash = hashlib.md5(command.encode()).hexdigest()[:12]
 
         try:
+            logger.debug(f"[{host}] Connecting for screen session...")
             client = self.connect()
-
-            logger.info(f"Connected to {self.instance.public_ip_address}")
+            logger.debug(f"[{host}] Connected, starting screen session...")
 
             channel = self.shell(client)
 
@@ -231,6 +265,8 @@ class Session:
         if self.instance.state != self.InstanceStatus.RUNNING:
             raise ValueError(f"Instance {self.instance.instance_id} is not running")
 
+        host = self.instance.public_ip_address
+        logger.debug(f"[{host}] Connecting for SFTP upload ({len(local_paths)} file(s))...")
         client = self.connect()
         try:
             if remote_dir is None:
@@ -243,15 +279,18 @@ class Session:
                 _, stdout, _ = client.exec_command(f"mkdir -p {remote_dir}")
                 stdout.channel.recv_exit_status()
 
+            logger.debug(f"[{host}] Uploading to {remote_dir}...")
             sftp = client.open_sftp()
             remote_paths = []
             for local_path in local_paths:
                 filename = os.path.basename(local_path)
                 remote_path = f"{remote_dir}/{filename}"
+                logger.debug(f"[{host}] Uploading {filename} -> {remote_path}")
                 sftp.put(local_path, remote_path)
                 sftp.chmod(remote_path, 0o755)
                 remote_paths.append(remote_path)
             sftp.close()
+            logger.debug(f"[{host}] Upload complete ({len(remote_paths)} file(s))")
         finally:
             client.close()
 
@@ -296,14 +335,7 @@ class Session:
             temp_dir = Path(_td)
             paths_to_upload: list[str] = []
 
-            wrapper_contents = [
-                # default shell
-                "#!/usr/bin/env sh",
-                # get location of scripts
-                'script_dir="$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd)"',
-                # cd to script dir
-                "cd ${script_dir}",
-            ]
+            wrapper_contents = ["SCRIPT_DIR=$(dirname $0)\n"]
 
             # copy files over, make them executable
             for script_ in scripts or []:
@@ -317,7 +349,7 @@ class Session:
                     script_name=script_path.name,
                 )
                 paths_to_upload.append(str(new_script_path))
-                wrapper_contents.append(f"./{new_script_path.name}")
+                wrapper_contents.append(f"./${{SCRIPT_DIR}}/{new_script_path.name}\n")
 
             # add command after the script paths
             for c in commands or []:
@@ -333,7 +365,7 @@ class Session:
 
             remote_dir, _ = self.upload_files(paths_to_upload)
 
-        return remote_dir, f"cd {remote_dir} && bash {wrapper_path.name}"
+        return remote_dir, f"bash {remote_dir}/{wrapper_path.name}"
 
 
 def import_ssh_key_to_ec2(key_name: str, region: str, private_key_path: str) -> str:

@@ -87,30 +87,3 @@ def make_aws_credentials(
     string_buffer = StringIO()
     aws_credentials.write(string_buffer)
     return string_buffer.getvalue()
-
-
-def script_to_command(script_path: str, to_file: bool = True) -> str:
-    """
-    Convert a script to a command that can be executed on an EC2 instance.
-
-    Args:
-        script_path: Path to the script to convert
-        to_file: Whether to save the script to a file and run it from there
-
-    Returns:
-        The command to execute the script on the EC2 instance
-    """
-    assert os.path.isfile(script_path), f"Script file not found: {script_path}"
-
-    with open(script_path, "rb") as f:
-        script_content = f.read()
-
-    b64_script_content = base64.b64encode(script_content).decode()
-
-    if to_file:
-        file_name, extension = os.path.splitext(os.path.basename(script_path))
-        h = hashlib.sha256(script_content).hexdigest()
-        script_path = f"{file_name}-{h}{extension}"
-        return f"echo '{b64_script_content}' | base64 -d > {script_path} && chmod +x {script_path} && bash {script_path}"
-    else:
-        return f"echo {b64_script_content} | base64 -d | bash"
