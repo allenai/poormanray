@@ -99,10 +99,11 @@ The CLI supports AWS and GCP via a backend module pattern:
 
 ### Tag/Label Conventions
 
-- AWS tags: `Project`, `Contact`, `Tool`, `ai2-project`, `Name` (title-case keys)
-- GCP labels: `project`, `contact`, `tool`, `ai2-project` (lowercase, `[a-z0-9_-]` only, max 63 chars)
-- `make_tags()` in cli.py handles the normalization per cloud
-- GCP instance `name` field replaces the AWS `Name` tag
+- AWS instance tags: `project`, `contact`, `tool`, `ai2-project`, `name` (all lowercase). Instance discovery remains compatible with legacy uppercase keys (`Project`, `Contact`, `Tool`, `Name`) and warns when they are encountered.
+- GCP instance labels: `project`, `contact`, `tool` (lowercase, `[a-z0-9_-]` only, max 63 chars)
+- GCP instance resource-manager tags: `ai2-project` is created as a resource-manager tag instead of a label
+- Shared tag construction lives in `tagging.py`
+- GCP instance `name` field replaces the AWS `name` tag for the instance resource name itself
 
 ### Remote Execution
 

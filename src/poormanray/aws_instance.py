@@ -8,6 +8,7 @@ from botocore.exceptions import ClientError
 
 from . import logger
 from .base_instance import BucketInfoBase, InstanceInfoBase, InstanceStatus
+from .tagging import aws_filter_variants, aws_tag_value, legacy_aws_tag_keys
 
 if TYPE_CHECKING:
     from mypy_boto3_ec2.client import EC2Client
@@ -64,12 +65,12 @@ class BucketInfo(BucketInfoBase):
         tool: str | None = None,
     ) -> dict[str, str]:
         tags = {
-            "Name": name,
-            "Project": name,
-            "Contact": owner,
+            "name": name,
+            "project": name,
+            "contact": owner,
         }
         if tool:
-            tags["Tool"] = tool
+            tags["tool"] = tool
         if project:
             tags["ai2-project"] = project
         return tags
@@ -313,7 +314,8 @@ class InstanceInfo(InstanceInfoBase):
         Returns:
             An InstanceInfo object populated with the instance details
         """
-        name = str(next((tag.get("Value") for tag in description.get("Tags", []) if tag.get("Key") == "Name"), ""))
+        tags = {tag["Key"]: tag.get("Value", "") for tag in description.get("Tags", []) if "Key" in tag}
+        name = aws_tag_value(tags, "name")
 
         instance = cls(
             instance_id=description.get("InstanceId", ""),
@@ -324,7 +326,7 @@ class InstanceInfo(InstanceInfoBase):
             public_dns_name=description.get("PublicDnsName", ""),
             name=name,
             created_at=description.get("LaunchTime", datetime.datetime.min),
-            tags={tag["Key"]: tag.get("Value", "") for tag in description.get("Tags", []) if "Key" in tag},
+            tags=tags,
             zone=description.get("Placement", {}).get("AvailabilityZone", ""),
         )
 
@@ -366,32 +368,32 @@ class InstanceInfo(InstanceInfoBase):
         client = client or ClientUtils.get_ec2_client(region=region or cls.region)
         assert client, "EC2 client is required"
 
-        filters = []
-        filters.append({"Name": "instance-state-name", "Values": [status.value for status in statuses]})
+        base_filters = [{"Name": "instance-state-name", "Values": [status.value for status in statuses]}]
 
         if instance_ids:
-            filters.append({"Name": "instance-id", "Values": instance_ids})
+            base_filters.append({"Name": "instance-id", "Values": instance_ids})
 
         if owner:
             logger.error("The owner tag is deprecated. Use the contact tag instead.")
 
-        if contact:
-            filters.append({"Name": "tag:Contact", "Values": [contact]})
-
-        if project:
-            filters.append({"Name": "tag:Project", "Values": [project]})
-
-        response_describe = client.describe_instances(  # pyright: ignore
-            **({"Filters": filters} if filters else {})
-        )
-
-        response_status = client.describe_instance_status(  # pyright: ignore
-            InstanceIds=[
-                id_
-                for reservation in response_describe.get("Reservations", [])
-                for instance in reservation.get("Instances", [])
-                if isinstance(id_ := instance.get("InstanceId"), str)
+        instance_descriptions: dict[str, Union[dict, "InstanceTypeDef"]] = {}
+        for tag_filters in aws_filter_variants(project=project, contact=contact):
+            filters = [
+                *base_filters,
+                *({"Name": f"tag:{key}", "Values": [value]} for key, value in tag_filters.items()),
             ]
+            response_describe = client.describe_instances(  # pyright: ignore
+                **({"Filters": filters} if filters else {})
+            )
+            for reservation in response_describe.get("Reservations", []):
+                for instance in reservation.get("Instances", []):
+                    if isinstance((id_ := instance.get("InstanceId")), str):
+                        instance_descriptions[id_] = instance
+
+        response_status = (
+            client.describe_instance_status(InstanceIds=list(instance_descriptions))  # pyright: ignore
+            if len(instance_descriptions) > 0
+            else {}
         )
 
         instance_statuses = {
@@ -401,11 +403,17 @@ class InstanceInfo(InstanceInfoBase):
         }
 
         instances = [
-            InstanceInfo.from_instance(description=instance, status=instance_statuses.get(id_, None))
-            for reservation in response_describe.get("Reservations", [])
-            for instance in reservation.get("Instances", [])
-            if isinstance((id_ := instance.get("InstanceId")), str)
+            InstanceInfo.from_instance(description=instance, status=instance_statuses.get(instance_id, None))
+            for instance_id, instance in instance_descriptions.items()
         ]
+
+        for instance in instances:
+            legacy_keys = legacy_aws_tag_keys(instance.tags)
+            if legacy_keys:
+                logger.warning(
+                    f"Instance {instance.instance_id} ({instance.name}) uses legacy AWS tag keys: "
+                    f"{', '.join(legacy_keys)}"
+                )
 
         return sorted(instances, key=lambda x: x.name)
 

@@ -30,6 +30,7 @@ from .commands import (
     PACKAGE_MANAGER_DETECTOR,
     make_decon_python_setup,
 )
+from .tagging import ClusterMetadata
 
 WAIT_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
@@ -78,27 +79,10 @@ def resolve_instance_type(instance_type: str | None, cloud: str) -> str:
     return "n2-standard-4" if cloud == "gcp" else "i4i.xlarge"
 
 
-def make_tags(name: str, owner: str, project: str | None, cloud: str) -> dict[str, str]:
-    if cloud == "gcp":
-        from .gcp_instance import _sanitize_label_value
+def resolve_gcp_resource_manager_tags(project: str | None, gcp_project: str | None) -> dict[str, str]:
+    from .gcp_instance import resolve_ai2_project_resource_manager_tags
 
-        tags: dict[str, str] = {
-            "project": _sanitize_label_value(name),
-            "contact": _sanitize_label_value(owner),
-        }
-        if __package__:
-            tags["tool"] = _sanitize_label_value(__package__)
-        if project:
-            tags["ai2-project"] = _sanitize_label_value(project)
-        return tags
-    else:
-        tags = {
-            "Project": name,
-            "Contact": owner,
-            **({"Tool": __package__} if __package__ else {}),
-            **({"ai2-project": project} if project else {}),
-        }
-        return tags
+    return resolve_ai2_project_resource_manager_tags(project, gcp_project=gcp_project)
 
 
 def run_in_parallel(
@@ -467,8 +451,19 @@ def create_instances(
 
     assert owner is not None, "Cannot determine owner from environment; please specify --owner"
 
-    tags = make_tags(name, owner, project, cloud)
-    logger.info(f"Using tags: {tags}")
+    cluster_metadata = ClusterMetadata(name=name, owner=owner, project=project, tool=__package__)
+    aws_tags = cluster_metadata.aws_cluster_tags()
+    gcp_metadata = (
+        cluster_metadata.gcp_instance_metadata(resolve_gcp_resource_manager_tags(project, gcp_project))
+        if cloud == "gcp"
+        else None
+    )
+    if cloud == "gcp":
+        logger.info(f"Using labels: {gcp_metadata.labels}")
+        if gcp_metadata.tags:
+            logger.info(f"Using tags: {gcp_metadata.tags}")
+    else:
+        logger.info(f"Using tags: {aws_tags}")
 
     # SSH key import is AWS-only
     key_name = None
@@ -517,7 +512,8 @@ def create_instances(
                 region=region,
                 zone=zone,
                 instance_name=instance_name,
-                labels=tags,
+                labels=gcp_metadata.labels,
+                resource_manager_tags=gcp_metadata.tags,
                 image=image_id,
                 wait_for_completion=not detach,
                 ssh_user=owner,
@@ -530,7 +526,7 @@ def create_instances(
             ec2_client = ClientUtils.get_ec2_client(region=region)
             instance = InstanceInfo.create_instance(
                 instance_type=instance_type,
-                tags=tags | {"Name": instance_name},
+                tags=cluster_metadata.aws_instance_tags(instance_name),
                 key_name=key_name,
                 region=region,
                 ami_id=image_id,
@@ -619,6 +615,11 @@ def create_bucket(
     )
     logger.info(f"Creating bucket '{name}' in region {region} ({cloud})")
     logger.info(f"Using tags: {bucket_tags}")
+    if cloud == "gcp" and project:
+        logger.warning(
+            "GCP bucket ai2-project metadata still uses labels in the current storage client path; "
+            "resource-manager tags are only applied to instances."
+        )
 
     try:
         if cloud == "gcp":
@@ -700,6 +701,11 @@ def update_bucket(
         tool=__package__,
     )
     logger.info(f"Updating bucket '{name}' in region {region} ({cloud})")
+    if cloud == "gcp" and project:
+        logger.warning(
+            "GCP bucket ai2-project metadata still uses labels in the current storage client path; "
+            "resource-manager tags are only applied to instances."
+        )
 
     try:
         if cloud == "gcp":
@@ -826,21 +832,29 @@ def update_cluster(
 
     assert owner is not None, "Cannot determine owner from environment; please specify --owner"
 
-    tags = make_tags(name, owner, project, cloud)
+    cluster_metadata = ClusterMetadata(name=name, owner=owner, project=project, tool=__package__)
     logger.info(f"Updating cluster tags for project={name} in region {region} ({cloud})")
-    logger.info(f"Ensuring tags exist: {tags}")
 
     try:
         if cloud == "gcp":
+            gcp_metadata = cluster_metadata.gcp_instance_metadata(
+                resolve_gcp_resource_manager_tags(project, gcp_project)
+            )
+            logger.info(f"Ensuring labels exist: {gcp_metadata.labels}")
+            if gcp_metadata.tags:
+                logger.info(f"Expected resource-manager tags: {gcp_metadata.tags}")
             instances, added_tags = InstanceInfo.update_cluster_tags(
                 project=name,
-                tags=tags,
+                labels=gcp_metadata.labels,
                 region=region,
                 instance_ids=instance_id,
                 statuses=InstanceStatus.unterminated(),
                 gcp_project=gcp_project,
+                resource_manager_tags=gcp_metadata.tags,
             )
         else:
+            tags = cluster_metadata.aws_cluster_tags()
+            logger.info(f"Ensuring tags exist: {tags}")
             ClientUtils = backend.ClientUtils
             client = ClientUtils.get_ec2_client(region=region)
             assert client, "EC2 client is required"

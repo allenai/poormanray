@@ -303,7 +303,7 @@ If the bucket is not empty, `pmr` will suggest running `s5cmd rm s3://<bucket>/*
 
 #### `update-cluster` - Backfill missing cluster tags/labels
 
-Adds missing default tags (AWS: `Project`, `Contact`, `Tool`, `ai2-project`; GCP: lowercase equivalents) to instances without overwriting existing values.
+Adds missing default metadata to instances without overwriting existing values. On AWS this backfills lowercase tags (`project`, `contact`, `tool`, `ai2-project`) while still recognizing legacy uppercase tag keys. On GCP this backfills labels (`project`, `contact`, `tool`); `ai2-project` is created as a resource-manager tag during instance creation and is not backfilled by `update-cluster`.
 
 ```bash
 pmr update-cluster --name mycluster@my-ai2-project
@@ -385,7 +385,7 @@ pmr setup-decon --name mycluster --github-token ghp_xxx --detach
 
 1. **Cloud Backend**: The `--cloud` flag selects the backend module (AWS or GCP). Both expose the same interface (`InstanceInfo`, `BucketInfo`, etc.) so all commands work identically across clouds. Shared logic — `InstanceStatus` enum, display properties, bucket validation — lives in `base_instance.py`; each backend extends it with cloud-specific operations.
 
-2. **Instance Tagging**: Instances are tagged with `Project` (cluster name), `Contact` (owner), and `Tool` (`poormanray`). On GCP, labels are lowercase-sanitized to meet GCE requirements.
+2. **Instance Tagging**: AWS instances use lowercase tags: `project` (cluster name), `contact` (owner), `tool` (`poormanray`), and `name` (per-instance name). Legacy uppercase AWS tag keys are still recognized for filtering. GCP stores `project`, `contact`, and `tool` as lowercase labels, and stores `ai2-project` as a resource-manager tag.
 
 3. **SSH Key Management**: On AWS, your local SSH key is imported to EC2 as a key pair. On GCP, the public key is injected into instance metadata.
 

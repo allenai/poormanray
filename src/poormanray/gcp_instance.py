@@ -1,7 +1,7 @@
 import dataclasses as dt
 import datetime
+import functools
 import os
-import re
 import shlex
 import shutil
 import subprocess
@@ -9,8 +9,12 @@ from typing import Any, Optional
 
 from . import logger
 from .base_instance import BucketInfoBase, InstanceInfoBase, InstanceStatus
+from .tagging import GCP_AI2_PROJECT_TAG_KEY, display_gcp_resource_manager_tags
+from .tagging import sanitize_gcp_label_value as _sanitize_label_value
 
 try:
+    import google.auth
+    from google.auth.transport.requests import AuthorizedSession
     from google.cloud import compute_v1, storage
 except ImportError as _gcp_import_error:
     raise ImportError(
@@ -35,6 +39,9 @@ _STATUS_TO_GCE: dict[InstanceStatus, list[str]] = {
     InstanceStatus.STOPPING: ["STOPPING", "SUSPENDING"],
     InstanceStatus.STOPPED: ["TERMINATED", "SUSPENDED"],
 }
+
+_CLOUD_RESOURCE_MANAGER_API = "https://cloudresourcemanager.googleapis.com/v3"
+_GCP_TAG_PARENT_ENV_VARS = ("PMR_GCP_AI2_PROJECT_TAG_PARENT", "PMR_GCP_TAG_NAMESPACE")
 
 
 def _resolve_gcp_project(gcp_project: str | None) -> str:
@@ -62,6 +69,111 @@ def _resolve_gcp_project(gcp_project: str | None) -> str:
     )
 
 
+@functools.lru_cache(maxsize=1)
+def _get_authorized_session() -> AuthorizedSession:
+    credentials, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+    return AuthorizedSession(credentials)
+
+
+def _cloud_resource_manager_get(
+    path: str,
+    *,
+    params: dict[str, str] | None = None,
+    acceptable_statuses: tuple[int, ...] = (),
+) -> dict[str, Any] | None:
+    response = _get_authorized_session().get(
+        f"{_CLOUD_RESOURCE_MANAGER_API}/{path.lstrip('/')}",
+        params=params,
+        timeout=30,
+    )
+    if response.status_code in acceptable_statuses:
+        return None
+    response.raise_for_status()
+    return dict(response.json())
+
+
+@functools.lru_cache(maxsize=None)
+def _get_gcp_project_info(gcp_project: str) -> dict[str, Any]:
+    project_info = _cloud_resource_manager_get(f"projects/{gcp_project}", acceptable_statuses=(404,))
+    if project_info is not None:
+        return project_info
+
+    search_results = _cloud_resource_manager_get("projects:search", params={"query": f"projectId:{gcp_project}"})
+    projects = list(search_results.get("projects", [])) if search_results else []
+    for project in projects:
+        if project.get("projectId") == gcp_project:
+            return dict(project)
+
+    raise ValueError(f"Could not resolve GCP project metadata for {gcp_project}")
+
+
+@functools.lru_cache(maxsize=None)
+def _resolve_gcp_tag_parent_candidates(gcp_project: str) -> tuple[str, ...]:
+    project_info = _get_gcp_project_info(gcp_project)
+    assert project_info is not None, f"Could not resolve project metadata for {gcp_project}"
+
+    project_id = str(project_info.get("projectId", gcp_project))
+    parent = str(project_info.get("parent", ""))
+    organization_id: str | None = None
+
+    while parent.startswith("folders/"):
+        folder_info = _cloud_resource_manager_get(parent, acceptable_statuses=(403, 404))
+        if folder_info is None:
+            break
+        parent = str(folder_info.get("parent", ""))
+
+    if parent.startswith("organizations/"):
+        organization_id = parent.rsplit("/", 1)[-1]
+
+    candidates = []
+    for env_var in _GCP_TAG_PARENT_ENV_VARS:
+        if value := os.environ.get(env_var):
+            candidates.append(value)
+    if organization_id:
+        candidates.append(organization_id)
+    candidates.append(project_id)
+
+    return tuple(dict.fromkeys(candidate for candidate in candidates if candidate))
+
+
+@functools.lru_cache(maxsize=None)
+def _resolve_ai2_project_tag_parent(project_name: str, gcp_project: str) -> str:
+    sanitized_project = _sanitize_label_value(project_name)
+    attempted_names = []
+    for parent in _resolve_gcp_tag_parent_candidates(gcp_project):
+        namespaced_name = f"{parent}/{GCP_AI2_PROJECT_TAG_KEY}/{sanitized_project}"
+        attempted_names.append(namespaced_name)
+        tag_value = _cloud_resource_manager_get(
+            "tagValues/namespaced",
+            params={"name": namespaced_name},
+            acceptable_statuses=(403, 404),
+        )
+        if tag_value is None:
+            continue
+
+        return parent
+
+    attempted = ", ".join(attempted_names)
+    raise ValueError(
+        "Could not resolve the GCP ai2-project tag value. "
+        f"Tried: {attempted}. If the tag lives under a different parent, set "
+        f"{_GCP_TAG_PARENT_ENV_VARS[0]} to the correct organization or project ID."
+    )
+
+
+def resolve_ai2_project_resource_manager_tags(
+    project_name: str | None,
+    *,
+    gcp_project: str | None = None,
+) -> dict[str, str]:
+    if not project_name:
+        return {}
+
+    gcp_project_resolved = _resolve_gcp_project(gcp_project)
+    tag_parent = _resolve_ai2_project_tag_parent(project_name, gcp_project_resolved)
+    return {f"{tag_parent}/{GCP_AI2_PROJECT_TAG_KEY}": _sanitize_label_value(project_name)}
+
+
 def _read_ssh_public_key(private_key_path: str | None) -> str | None:
     if not private_key_path:
         return None
@@ -86,10 +198,6 @@ def _zone_from_url(zone_url: str) -> str:
 
 def _region_from_zone(zone: str) -> str:
     return zone.rsplit("-", 1)[0]
-
-
-def _sanitize_label_value(v: str) -> str:
-    return re.sub(r"[^a-z0-9_-]", "-", v.lower())[:63]
 
 
 class ClientUtils:
@@ -243,8 +351,10 @@ class InstanceInfo(InstanceInfoBase):
                     image_id = disk.source or ""
                     break
 
-        # Extract labels
         labels = dict(instance.labels) if instance.labels else {}
+        resource_manager_tags = {}
+        if instance.params and instance.params.resource_manager_tags:
+            resource_manager_tags = display_gcp_resource_manager_tags(instance.params.resource_manager_tags)
 
         # Parse created_at
         created_at = datetime.datetime.min
@@ -266,7 +376,7 @@ class InstanceInfo(InstanceInfoBase):
             public_ip_address=public_ip,
             public_dns_name="",
             name=instance.name or "",
-            tags=labels,
+            tags=labels | resource_manager_tags,
             zone=zone,
             created_at=created_at,
             region=region,
@@ -382,16 +492,23 @@ class InstanceInfo(InstanceInfoBase):
     def update_cluster_tags(
         cls,
         project: str,
-        tags: dict[str, str],
+        labels: dict[str, str],
         *,
         region: str = "us-central1",
         instance_ids: list[str] | None = None,
         statuses: list["InstanceStatus"] | None = None,
         client: Any = None,
         gcp_project: str | None = None,
+        resource_manager_tags: dict[str, str] | None = None,
     ) -> tuple[list["InstanceInfo"], dict[str, dict[str, str]]]:
         gcp_project_resolved = _resolve_gcp_project(gcp_project)
         client = client or compute_v1.InstancesClient()
+
+        if resource_manager_tags:
+            logger.warning(
+                "GCP resource-manager tags are only applied during instance creation; "
+                "update-cluster will not backfill ai2-project tags."
+            )
 
         instances = cls.describe_instances(
             instance_ids=instance_ids,
@@ -404,7 +521,7 @@ class InstanceInfo(InstanceInfoBase):
 
         added_tags: dict[str, dict[str, str]] = {}
         for instance in instances:
-            missing = {k: v for k, v in tags.items() if k not in instance.tags}
+            missing = {k: v for k, v in labels.items() if k not in instance.tags}
             if not missing:
                 continue
 
@@ -448,6 +565,7 @@ class InstanceInfo(InstanceInfoBase):
         zone: str | None = None,
         instance_name: str | None = None,
         labels: dict[str, str] | None = None,
+        resource_manager_tags: dict[str, str] | None = None,
         image: str | None = None,
         wait_for_completion: bool = True,
         ssh_user: str | None = None,
@@ -510,6 +628,11 @@ class InstanceInfo(InstanceInfoBase):
             disks=[boot_disk],
             network_interfaces=[network_interface],
             labels=labels or {},
+            params=(
+                compute_v1.InstanceParams(resource_manager_tags=resource_manager_tags)
+                if resource_manager_tags
+                else None
+            ),
             metadata=compute_v1.Metadata(items=metadata_items) if metadata_items else None,
             service_accounts=[
                 compute_v1.ServiceAccount(
