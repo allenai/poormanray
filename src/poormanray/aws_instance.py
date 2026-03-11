@@ -8,7 +8,7 @@ from botocore.exceptions import ClientError
 
 from . import logger
 from .base_instance import BucketInfoBase, InstanceInfoBase, InstanceStatus
-from .tagging import aws_filter_variants, aws_tag_value, legacy_aws_tag_keys
+from .tagging import aws_filter_variants, aws_tag_value, legacy_aws_tag_keys, migrate_legacy_aws_tags
 
 if TYPE_CHECKING:
     from mypy_boto3_ec2.client import EC2Client
@@ -65,7 +65,7 @@ class BucketInfo(BucketInfoBase):
         tool: str | None = None,
     ) -> dict[str, str]:
         tags = {
-            "name": name,
+            "Name": name,
             "project": name,
             "contact": owner,
         }
@@ -247,8 +247,14 @@ class BucketInfo(BucketInfoBase):
             if cls._error_code(error) != "NoSuchTagSet":
                 raise
 
+        migrated_tags, legacy_keys_to_delete = migrate_legacy_aws_tags(existing_tags)
+        for key in legacy_keys_to_delete:
+            del existing_tags[key]
+        existing_tags.update(migrated_tags)
+
         requested_tags = tags or {}
         missing_tags = {key: value for key, value in requested_tags.items() if key not in existing_tags}
+        missing_tags.update(migrated_tags)
         if len(missing_tags) > 0:
             client.put_bucket_tagging(
                 Bucket=bucket_name,
@@ -315,7 +321,7 @@ class InstanceInfo(InstanceInfoBase):
             An InstanceInfo object populated with the instance details
         """
         tags = {tag["Key"]: tag.get("Value", "") for tag in description.get("Tags", []) if "Key" in tag}
-        name = aws_tag_value(tags, "name")
+        name = aws_tag_value(tags, "Name")
 
         instance = cls(
             instance_id=description.get("InstanceId", ""),
@@ -481,14 +487,26 @@ class InstanceInfo(InstanceInfoBase):
         added_tags: dict[str, dict[str, str]] = {}
         for instance in instances:
             missing_tags = {key: value for key, value in tags.items() if key not in instance.tags}
-            if len(missing_tags) == 0:
-                continue
+            migrated_tags, legacy_keys_to_delete = migrate_legacy_aws_tags(instance.tags)
+            missing_tags.update(migrated_tags)
 
-            client.create_tags(
-                Resources=[instance.instance_id],
-                Tags=[{"Key": key, "Value": value} for key, value in missing_tags.items()],
-            )
-            added_tags[instance.instance_id] = missing_tags
+            if missing_tags:
+                client.create_tags(
+                    Resources=[instance.instance_id],
+                    Tags=[{"Key": key, "Value": value} for key, value in missing_tags.items()],
+                )
+            if legacy_keys_to_delete:
+                logger.info(
+                    f"Migrating legacy tag keys on {instance.instance_id}: "
+                    f"{', '.join(f'{k} -> {v}' for k, v in zip(legacy_keys_to_delete, migrated_tags))}"
+                )
+                client.delete_tags(
+                    Resources=[instance.instance_id],
+                    Tags=[{"Key": key} for key in legacy_keys_to_delete],
+                )
+
+            if missing_tags or legacy_keys_to_delete:
+                added_tags[instance.instance_id] = missing_tags
 
         return instances, added_tags
 

@@ -4,7 +4,7 @@ import re
 from collections.abc import Mapping
 
 AWS_LEGACY_TAG_KEYS: dict[str, str] = {
-    "name": "Name",
+    "Name": "name",
     "project": "Project",
     "contact": "Contact",
     "tool": "Tool",
@@ -23,6 +23,17 @@ def aws_tag_value(tags: Mapping[str, str], key: str) -> str:
 
 def legacy_aws_tag_keys(tags: Mapping[str, str]) -> tuple[str, ...]:
     return tuple(key for key in AWS_LEGACY_TAG_KEYS_BY_LEGACY if key in tags)
+
+
+def migrate_legacy_aws_tags(tags: Mapping[str, str]) -> tuple[dict[str, str], list[str]]:
+    """Return (tags_to_add, keys_to_delete) to migrate legacy-cased tag keys to canonical keys."""
+    add: dict[str, str] = {}
+    delete: list[str] = []
+    for legacy_key, canonical_key in AWS_LEGACY_TAG_KEYS_BY_LEGACY.items():
+        if legacy_key in tags and canonical_key not in tags:
+            add[canonical_key] = tags[legacy_key]
+            delete.append(legacy_key)
+    return add, delete
 
 
 def aws_filter_variants(*, project: str | None = None, contact: str | None = None) -> list[dict[str, str]]:
@@ -75,7 +86,7 @@ class ClusterMetadata:
         return tags
 
     def aws_instance_tags(self, instance_name: str) -> dict[str, str]:
-        return self.aws_cluster_tags() | {"name": instance_name}
+        return self.aws_cluster_tags() | {"Name": instance_name}
 
     def gcp_instance_metadata(self, resource_manager_tags: dict[str, str] | None = None) -> ResourceMetadata:
         labels = {
