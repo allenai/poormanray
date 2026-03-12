@@ -4,6 +4,7 @@ import math
 import os
 import random
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -11,7 +12,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, TypeVar
 
 import paramiko
@@ -355,6 +356,98 @@ class Session:
             return self.run_in_screen(command, detach=detach, terminate=terminate, timeout=(timeout or 600))
         else:
             return self.run_single(command, get_pty=get_pty, timeout=timeout)
+
+    def _ensure_remote_dir(self, client: paramiko.SSHClient, remote_dir: str) -> None:
+        if remote_dir in ("", "."):
+            return
+
+        _, stdout, stderr = client.exec_command(f"mkdir -p -- {shlex.quote(remote_dir)}")
+        exit_status = stdout.channel.recv_exit_status()
+        if exit_status != 0:
+            err = stderr.read().decode("utf-8").strip()
+            message = err or f"exit status {exit_status}"
+            raise RuntimeError(f"Failed to create remote directory {remote_dir}: {message}")
+
+    def _transfer_file(
+        self,
+        client: paramiko.SSHClient,
+        sftp: paramiko.SFTPClient,
+        local_path: Path,
+        remote_path: str,
+    ) -> str:
+        remote_target = str(PurePosixPath(remote_path) / local_path.name) if remote_path.endswith("/") else remote_path
+        self._ensure_remote_dir(client, str(PurePosixPath(remote_target).parent))
+        sftp.put(str(local_path), remote_target)
+        sftp.chmod(remote_target, stat.S_IMODE(local_path.stat().st_mode))
+        return remote_target
+
+    def _transfer_directory(
+        self,
+        client: paramiko.SSHClient,
+        sftp: paramiko.SFTPClient,
+        local_path: Path,
+        remote_path: str,
+    ) -> str:
+        remote_root = remote_path.rstrip("/") or "/"
+        self._ensure_remote_dir(client, remote_root)
+
+        for root, _, files in os.walk(local_path):
+            relative_root = Path(root).relative_to(local_path)
+            current_remote_root = PurePosixPath(remote_root)
+            if relative_root != Path("."):
+                current_remote_root /= PurePosixPath(relative_root.as_posix())
+                self._ensure_remote_dir(client, str(current_remote_root))
+
+            for file_name in files:
+                local_file = Path(root) / file_name
+                remote_file = str(current_remote_root / file_name)
+                sftp.put(str(local_file), remote_file)
+                sftp.chmod(remote_file, stat.S_IMODE(local_file.stat().st_mode))
+
+        return remote_root
+
+    def transfer_paths(
+        self,
+        transfers: list[tuple[str, str]],
+    ) -> list[str]:
+        """Transfer local files or directories to explicit remote destinations."""
+        if self.instance.state != self.InstanceStatus.RUNNING:
+            raise ValueError(f"Instance {self.instance.instance_id} is not running")
+
+        if len(transfers) == 0:
+            raise RuntimeError("No transfer paths provided")
+
+        return self._with_connection_retries(
+            operation="file transfer",
+            action=lambda client: self._transfer_paths_once(client, transfers),
+        )
+
+    def _transfer_paths_once(
+        self,
+        client: paramiko.SSHClient,
+        transfers: list[tuple[str, str]],
+    ) -> list[str]:
+        host = self.instance.public_ip_address
+        logger.debug(f"[{host}] Transferring {len(transfers)} path(s)...")
+
+        sftp = client.open_sftp()
+        try:
+            remote_targets = []
+            for local_path, remote_path in transfers:
+                local_path_ = Path(local_path)
+                logger.debug(f"[{host}] Transferring {local_path_} -> {remote_path}")
+
+                if local_path_.is_dir():
+                    remote_targets.append(self._transfer_directory(client, sftp, local_path_, remote_path))
+                elif local_path_.is_file():
+                    remote_targets.append(self._transfer_file(client, sftp, local_path_, remote_path))
+                else:
+                    raise ValueError(f"Transfer source {local_path_} does not exist")
+        finally:
+            sftp.close()
+
+        logger.debug(f"[{host}] Transfer complete ({len(remote_targets)} path(s))")
+        return remote_targets
 
     def upload_files(
         self,

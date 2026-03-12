@@ -188,6 +188,46 @@ def _parse_project_name(ctx: click.Context, param: click.Parameter, value: str |
         return value
 
 
+def _default_ssh_key_path() -> str | None:
+    from .ssh_session import DEFAULT_PRIVATE_KEY_NAMES
+
+    ssh_home = os.path.join(os.path.expanduser("~"), ".ssh")
+    return next(
+        (
+            os.path.join(ssh_home, key_name)
+            for key_name in DEFAULT_PRIVATE_KEY_NAMES
+            if os.path.exists(os.path.join(ssh_home, key_name))
+        ),
+        None,
+    )
+
+
+def _parse_transfer_specs(
+    _: click.Context, param: click.Parameter, value: tuple[str, ...]
+) -> list[tuple[str, str]]:
+    if len(value) == 0:
+        raise click.UsageError(f"At least one {param.opts[0]} option must be provided")
+
+    transfer_specs: list[tuple[str, str]] = []
+    for raw_value in value:
+        source, separator, destination = raw_value.rpartition(":")
+        source = source.strip()
+        destination = destination.strip()
+
+        if separator == "" or not source or not destination:
+            raise click.UsageError(
+                f"Transfer spec must use the format 'source:destination'; received {raw_value!r}"
+            )
+
+        source = os.path.abspath(source)
+        if not os.path.exists(source):
+            raise click.UsageError(f"Transfer source not found: {source}")
+
+        transfer_specs.append((source, destination))
+
+    return transfer_specs
+
+
 def base_cli_options(f: T) -> T:
     """Options shared by all commands: name, project, region, owner, cloud."""
     click_decorators = [
@@ -233,18 +273,58 @@ def base_cli_options(f: T) -> T:
     return reduce(lambda f, decorator: decorator(f), click_decorators, f)
 
 
-def common_cli_options(f: T) -> T:
-    ssh_home = os.path.join(os.path.expanduser("~"), ".ssh")
-    default_key_names = ["id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"]
-    default_key_path = next(
-        (
-            os.path.join(ssh_home, key_name)
-            for key_name in default_key_names
-            if os.path.exists(os.path.join(ssh_home, key_name))
+def _shared_instance_options() -> list:
+    """Options shared by commands that target existing instances (SSH, parallelism, etc.)."""
+    default_key_path = _default_ssh_key_path()
+    return [
+        click.option(
+            "--banner-timeout",
+            type=int,
+            default=15,
+            help="SSH banner timeout in seconds (default: 15)",
         ),
-        None,
-    )
+        click.option(
+            "-i",
+            "--instance-id",
+            multiple=True,
+            default=None,
+            type=click.UNPROCESSED,
+            callback=lambda _, __, value: list(value) or None,
+            help="Instance ID to work on; can be used multiple times. If none, command applies to all instances",
+        ),
+        click.option(
+            "-k",
+            "--ssh-key-path",
+            type=click.Path(exists=True, file_okay=True, dir_okay=False),
+            default=default_key_path,
+            help="Path to the SSH private key file",
+        ),
+        click.option(
+            "-j",
+            "--parallelism",
+            type=click.IntRange(min=1),
+            default=None,
+            help="Maximum number of instances to run in parallel (default: all selected instances)",
+        ),
+        click.option(
+            "-u",
+            "--instance-username",
+            type=str,
+            default=None,
+            help="Username to use for SSH connections (default: ec2-user for AWS, owner for GCP)",
+        ),
+        click.option(
+            "-G",
+            "--gcp-project",
+            type=str,
+            default=None,
+            envvar="GCP_PROJECT",
+            help="GCP project ID (env: GCP_PROJECT). Required when --cloud=gcp.",
+        ),
+    ]
 
+
+def common_cli_options(f: T) -> T:
     def validate_command_or_script(
         ctx: click.Context, param: click.Parameter, value: str | None
     ) -> str | list[str] | None:
@@ -279,33 +359,11 @@ def common_cli_options(f: T) -> T:
         click.option("-N", "--number", type=int, default=1, help="Number of instances"),
         click.option("-T", "--timeout", type=int, default=None, help="Timeout for the command"),
         click.option(
-            "--banner-timeout",
-            type=int,
-            default=15,
-            help="SSH banner timeout in seconds (default: 15)",
-        ),
-        click.option(
             "-S/-NS",
             "--spindown/--no-spindown",
             type=bool,
             default=False,
             help="Whether to have the instance self-terminate after the command is run",
-        ),
-        click.option(
-            "-i",
-            "--instance-id",
-            multiple=True,
-            default=None,
-            type=click.UNPROCESSED,
-            callback=lambda _, __, value: list(value) or None,
-            help="Instance ID to work on; can be used multiple times. If none, command applies to all instances",
-        ),
-        click.option(
-            "-k",
-            "--ssh-key-path",
-            type=click.Path(exists=True, file_okay=True, dir_okay=False),
-            default=default_key_path,
-            help="Path to the SSH private key file",
         ),
         click.option(
             "-a",
@@ -314,13 +372,6 @@ def common_cli_options(f: T) -> T:
             type=str,
             default=None,
             help="Image ID (AMI for AWS, image family for GCP) to use for the instances",
-        ),
-        click.option(
-            "-j",
-            "--parallelism",
-            type=click.IntRange(min=1),
-            default=None,
-            help="Maximum number of instances to run in parallel (default: all selected instances)",
         ),
         click.option(
             "-d/-nd",
@@ -346,21 +397,26 @@ def common_cli_options(f: T) -> T:
             callback=validate_command_or_script,
             help="Path to a script file or directory containing scripts to execute on the instances",
         ),
+        *_shared_instance_options(),
+    ]
+
+    f = reduce(lambda f, decorator: decorator(f), click_decorators, f)
+    return base_cli_options(f)
+
+
+def transfer_cli_options(f: T) -> T:
+    click_decorators = [
         click.option(
-            "-u",
-            "--instance-username",
+            "-s",
+            "--source",
+            "transfer_specs",
             type=str,
-            default=None,
-            help="Username to use for SSH connections (default: ec2-user for AWS, owner for GCP)",
+            multiple=True,
+            required=True,
+            callback=_parse_transfer_specs,
+            help="Transfer spec in the form 'source:destination'; can be used multiple times",
         ),
-        click.option(
-            "-G",
-            "--gcp-project",
-            type=str,
-            default=None,
-            envvar="GCP_PROJECT",
-            help="GCP project ID (env: GCP_PROJECT). Required when --cloud=gcp.",
-        ),
+        *_shared_instance_options(),
     ]
 
     f = reduce(lambda f, decorator: decorator(f), click_decorators, f)
@@ -1233,7 +1289,7 @@ def run_command(
         for instance in non_running_instances:
             logger.error(f"Instance {instance.instance_id} is not running (state: {instance.state})")
         non_running_ids = ", ".join(instance.instance_id for instance in non_running_instances)
-        raise ValueError(f"Instances are not running: {non_running_ids}")
+        raise click.ClickException(f"Instances are not running: {non_running_ids}")
 
     max_workers = len(instances) if parallelism is None else min(parallelism, len(instances))
     logger.info(f"Running command on {len(instances)} instances with max parallelism={max_workers}")
@@ -1286,6 +1342,120 @@ def run_command(
         raise click.ClickException(f"Command execution failed on {len(errors)} instance(s): {failed_instance_ids}")
 
     logger.info(f"Command execution completed on {len(instances)} instances")
+
+
+@transfer_cli_options
+def transfer_files(
+    name: str,
+    region: str | None,
+    owner: str | None,
+    instance_id: list[str] | None,
+    transfer_specs: list[tuple[str, str]],
+    ssh_key_path: str,
+    instance_username: str | None,
+    cloud: str,
+    gcp_project: str | None,
+    parallelism: int | None = None,
+    banner_timeout: int = 15,
+    **kwargs,
+):
+    """
+    Transfer local files or directories to all selected instances.
+
+    Each `--source/-s` argument uses the form `source:destination`, where
+    `source` is a local path and `destination` is the target path on the
+    remote instance. File transfers use the destination as an exact remote
+    file path unless it ends with `/`, in which case the source filename is
+    appended. Directory transfers copy the directory contents into the remote
+    destination directory.
+
+    \f
+
+    Args:
+        name: Cluster name used to select instances via the `Project` tag/label.
+        region: Cloud region where files are transferred.
+        owner: Owner value.
+        instance_id: Optional instance IDs to target.
+        transfer_specs: Local-to-remote transfer specs.
+        ssh_key_path: Path to the local private SSH key for authentication.
+        instance_username: Username used for SSH connections.
+        cloud: Cloud provider (aws or gcp).
+        gcp_project: GCP project ID.
+        parallelism: Maximum number of concurrent transfers.
+        banner_timeout: SSH banner timeout in seconds.
+        **kwargs: Additional CLI options injected by shared decorators; ignored here.
+    """
+    from .ssh_session import Session
+
+    region = resolve_region(region, cloud)
+    backend = resolve_backend(cloud)
+    InstanceInfo = backend.InstanceInfo
+    InstanceStatus = backend.InstanceStatus
+    instance_username = resolve_instance_username(instance_username, cloud, owner or "")
+
+    logger.info(
+        f"Transferring {len(transfer_specs)} path(s) to instances with project={name} in region {region} ({cloud})"
+    )
+
+    instances = InstanceInfo.describe_instances(
+        region=region,
+        project=name,
+        **({"gcp_project": gcp_project} if cloud == "gcp" else {}),
+    )
+    logger.info(f"Found {len(instances)} instances matching the specified tags")
+
+    if instance_id is not None:
+        logger.info(f"Filtering to {len(instance_id)} specified instance IDs")
+        instances = [instance for instance in instances if instance.instance_id in instance_id]
+        logger.info(f"After filtering, files will be transferred to {len(instances)} instances")
+
+    if len(instances) == 0:
+        logger.warning("No instances found to transfer files to")
+        return
+
+    non_running_instances = [instance for instance in instances if instance.state != InstanceStatus.RUNNING]
+    if len(non_running_instances) > 0:
+        for instance in non_running_instances:
+            logger.error(f"Instance {instance.instance_id} is not running (state: {instance.state})")
+        non_running_ids = ", ".join(instance.instance_id for instance in non_running_instances)
+        raise click.ClickException(f"Instances are not running: {non_running_ids}")
+
+    def transfer_to_instance(instance) -> list[str]:
+        logger.info(f"Transferring files to instance {instance.instance_id} ({instance.name})")
+
+        session = Session(
+            instance_id=instance.instance_id,
+            region=region,
+            private_key_path=ssh_key_path,
+            user=instance_username,
+            cloud=cloud,
+            gcp_project=gcp_project,
+            banner_timeout=banner_timeout,
+        )
+
+        return session.transfer_paths(transfer_specs)
+
+    transferred, errors = run_in_parallel(
+        instances,
+        transfer_to_instance,
+        parallelism=parallelism,
+        action_name="file transfer",
+    )
+
+    for idx, instance in enumerate(instances):
+        print(f"Instance {instance.instance_id}:")
+        if idx in transferred:
+            for (source_path, _), remote_path in zip(transfer_specs, transferred[idx]):
+                print(f"{source_path} -> {remote_path}")
+        else:
+            print(f"ERROR: {errors[idx]}")
+        print()
+
+    if errors:
+        failed_instance_ids = ", ".join(instances[idx].instance_id for idx in sorted(errors))
+        raise click.ClickException(f"File transfer failed on {len(errors)} instance(s): {failed_instance_ids}")
+
+    logger.info(f"File transfer completed on {len(instances)} instances")
 
 
 @common_cli_options
@@ -2001,6 +2171,7 @@ cli.command(name="list")(list_instances)
 cli.command(name="terminate")(terminate_instances)
 cli.command(name="update-cluster")(update_cluster)
 cli.command(name="run")(run_command)
+cli.command(name="transfer")(transfer_files)
 cli.command(name="setup")(setup_instances)
 cli.command(name="setup-d2tk")(setup_dolma2_toolkit)
 cli.command(name="setup-dolma-python")(setup_dolma_python)
